@@ -1,4 +1,7 @@
 [target.bpfel-unknown-none]
 linker = "bpf-linker"
-# LLVM BPF stack (bytes). Large FlowEvent / probe locals need a higher limit during codegen.
-rustflags = ["-C", "llvm-args=-bpf-stack-size=524288"]
+# rustc codegen + bpf-linker's own LLVM pass (link step) both need a larger BPF stack.
+rustflags = [
+    "-C", "llvm-args=-bpf-stack-size=1048576",
+    "-C", "link-arg=--llvm-args=--bpf-stack-size=1048576",
+]

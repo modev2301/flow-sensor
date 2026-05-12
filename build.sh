@@ -13,9 +13,19 @@ echo "→ Checking Rust nightly..."
 rustup toolchain install nightly --component rust-src 2>/dev/null || true
 rustup target add --toolchain nightly bpfel-unknown-none 2>/dev/null || true
 
-# bpf-linker loads rustc's libLLVM; some installs need the toolchain lib dir on LD_LIBRARY_PATH.
+# bpf-linker (via aya-rustc-llvm-proxy) dlopens rustc's libLLVM*.so — that .so often
+# depends on distro libs (zlib, ncurses, …) that live outside the rustup sysroot.
 RUST_SYSROOT="$(rustc +nightly --print sysroot)"
-export LD_LIBRARY_PATH="${RUST_SYSROOT}/lib:${LD_LIBRARY_PATH:-}"
+RUST_HOST="$(rustc +nightly -vV | sed -n 's/^host: //p')"
+export LD_LIBRARY_PATH="${RUST_SYSROOT}/lib:${RUST_SYSROOT}/lib/rustlib/${RUST_HOST}/lib:${LD_LIBRARY_PATH:-}"
+# Typical glibc multiarch paths (Debian/Ubuntu/Fedora-ish); harmless if missing.
+_GNU_TRIPLE="$(printf '%s\n' "${RUST_HOST}" | sed 's/-unknown-/-/')"
+for _bpf_lib in /usr/lib64 /lib64 "/usr/lib/${_GNU_TRIPLE}" "/lib/${_GNU_TRIPLE}"; do
+    if [ -d "${_bpf_lib}" ]; then
+        LD_LIBRARY_PATH="${_bpf_lib}:${LD_LIBRARY_PATH}"
+    fi
+done
+export LD_LIBRARY_PATH
 
 # Install bpf-linker if not present
 if ! command -v bpf-linker >/dev/null 2>&1; then
@@ -26,7 +36,7 @@ fi
 echo ""
 echo "→ Building eBPF programs (kernel space)..."
 # RUSTFLAGS only for this crate: do not pass BPF llvm-args to the host userspace build below.
-env RUSTFLAGS="${RUSTFLAGS:-} -Cllvm-args=-bpf-stack-size=524288" \
+env RUSTFLAGS="${RUSTFLAGS:-} -Cllvm-args=-bpf-stack-size=1048576 -Clink-arg=--llvm-args=--bpf-stack-size=1048576" \
     cargo +nightly build \
     --manifest-path flow-sensor-ebpf/Cargo.toml \
     --target bpfel-unknown-none \
