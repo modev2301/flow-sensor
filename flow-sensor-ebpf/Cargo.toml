@@ -18,3 +18,4 @@ flow-sensor-common = { path = "../flow-sensor-common", default-features = false 
 lto = false
 opt-level = 3
 codegen-units = 1
+panic = "abort"

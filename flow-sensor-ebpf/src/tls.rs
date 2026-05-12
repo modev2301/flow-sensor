@@ -365,9 +365,12 @@ unsafe fn handle_ssl_write_entry(ctx: &ProbeContext) -> Result<u32, i64> {
 /// **Section name:** use a unique `uretprobe/...` per program. Plain `uretprobe` merges every
 /// return probe into one ELF section; on older kernels (e.g. 5.15) that can trip `check_subprogs`
 /// (`last insn is not an exit or jmp`) even when aya loads by symbol.
+/// `extern "C"` so LLVM emits a single `exit` tail for this program. The Rust ABI can leave dead
+/// insns after `exit` (e.g. `call 0`), which breaks Linux 5.15 `check_subprogs` (`last insn is not
+/// an exit or jmp`).
 #[no_mangle]
 #[link_section = "uretprobe/ssl_write_return"]
-pub unsafe fn ssl_write_return(ctx: *mut c_void) -> u32 {
+pub unsafe extern "C" fn ssl_write_return(ctx: *mut c_void) -> u32 {
     let ctx = RetProbeContext::new(ctx);
     let pid_tgid = bpf_get_current_pid_tgid();
     let ret = match ctx.ret::<i32>() {
@@ -459,9 +462,10 @@ unsafe fn handle_ssl_read_entry(ctx: &ProbeContext) -> Result<u32, i64> {
     Ok(0)
 }
 
+/// See `ssl_write_return`: `extern "C"` for a clean BPF `exit` epilogue on older kernels.
 #[no_mangle]
 #[link_section = "uretprobe/ssl_read_return"]
-pub unsafe fn ssl_read_return(ctx: *mut c_void) -> u32 {
+pub unsafe extern "C" fn ssl_read_return(ctx: *mut c_void) -> u32 {
     let ctx = RetProbeContext::new(ctx);
     let pid_tgid = bpf_get_current_pid_tgid();
     let ret = match ctx.ret::<i32>() {
