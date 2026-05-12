@@ -147,6 +147,10 @@ pub const EMPTY_FLOW_STATE: FlowState = FlowState {
     congestion_state_final: 0,
 };
 
+/// Scratch: `pid_tgid` → `struct sock *` (as `u64`) between `tcp_recvmsg` kprobe and kretprobe.
+#[map]
+pub static RECVMSG_SOCK: HashMap<u64, u64> = HashMap::with_max_entries(4096, 0);
+
 /// LRU hash — kernel evicts oldest entries automatically under memory pressure
 /// Key: FlowKey (5-tuple), Value: FlowState
 #[map]

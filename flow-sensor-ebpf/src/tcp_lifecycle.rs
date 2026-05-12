@@ -301,7 +301,26 @@ unsafe fn handle_sendmsg(ctx: &ProbeContext) -> Result<u32, i64> {
     Ok(0)
 }
 
-/// Count bytes received — fires on tcp_recvmsg return
+/// `tcp_recvmsg` entry — stash `sock *` for this thread; kretprobe pairs it with byte count.
+#[kprobe(function = "tcp_recvmsg")]
+pub fn tcp_recvmsg_entry(ctx: ProbeContext) -> u32 {
+    match unsafe { handle_recvmsg_entry(&ctx) } {
+        Ok(ret) => ret,
+        Err(_) => 0,
+    }
+}
+
+unsafe fn handle_recvmsg_entry(ctx: &ProbeContext) -> Result<u32, i64> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let Some(sk) = ctx.arg::<*const core::ffi::c_void>(0) else {
+        return Ok(0);
+    };
+    let sk_addr = sk as usize as u64;
+    let _ = RECVMSG_SOCK.insert(&pid_tgid, &sk_addr, 0);
+    Ok(0)
+}
+
+/// Count bytes received — `tcp_recvmsg` return; uses `RECVMSG_SOCK` from entry probe.
 #[kretprobe(function = "tcp_recvmsg")]
 pub fn tcp_recvmsg(ctx: RetProbeContext) -> u32 {
     match unsafe { handle_recvmsg(&ctx) } {
@@ -311,10 +330,42 @@ pub fn tcp_recvmsg(ctx: RetProbeContext) -> u32 {
 }
 
 unsafe fn handle_recvmsg(ctx: &RetProbeContext) -> Result<u32, i64> {
-    let bytes = ctx.ret::<i64>().ok_or(-1)?;
-    if bytes <= 0 { return Ok(0); }
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let bytes = match ctx.ret::<i64>() {
+        Some(b) => b,
+        None => {
+            let _ = RECVMSG_SOCK.remove(&pid_tgid);
+            return Ok(0);
+        }
+    };
 
-    // We need the sock — stored in a scratch map keyed by pid_tgid
-    // (simplified here — full impl uses entry/exit pair)
+    if bytes <= 0 {
+        let _ = RECVMSG_SOCK.remove(&pid_tgid);
+        return Ok(0);
+    }
+
+    let sk_addr = match RECVMSG_SOCK.get(&pid_tgid) {
+        Some(v) => *v,
+        None => return Ok(0),
+    };
+    let sk = sk_addr as *const core::ffi::c_void;
+
+    let key = match flow_key_from_sock(sk) {
+        Some(k) => k,
+        None => {
+            let _ = RECVMSG_SOCK.remove(&pid_tgid);
+            return Ok(0);
+        }
+    };
+
+    if let Some(state) = FLOW_TABLE.get_ptr_mut(&key) {
+        (*state).bytes_recv = (*state).bytes_recv.saturating_add(bytes as u64);
+        (*state).pkts_recv = (*state).pkts_recv.saturating_add(1);
+        if (*state).first_recv_ts_ns == 0 {
+            (*state).first_recv_ts_ns = bpf_ktime_get_ns();
+        }
+    }
+
+    let _ = RECVMSG_SOCK.remove(&pid_tgid);
     Ok(0)
 }

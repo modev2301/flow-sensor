@@ -65,6 +65,7 @@ mod live {
             ("tcp_close", "tcp_close"),
             ("tcp_send_active_reset", "tcp_send_active_reset"),
             ("tcp_sendmsg", "tcp_sendmsg"),
+            ("tcp_recvmsg_entry", "tcp_recvmsg"),
             ("tcp_recvmsg", "tcp_recvmsg"),
             ("tcp_rcv_established", "tcp_rcv_established"),
             ("tcp_enter_cwr", "tcp_enter_cwr"),
