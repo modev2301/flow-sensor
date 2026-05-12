@@ -8,6 +8,10 @@ echo ""
 command -v cargo >/dev/null 2>&1 || { echo "❌ cargo not found. Install Rust: https://rustup.rs"; exit 1; }
 command -v clang >/dev/null 2>&1 || { echo "❌ clang not found. Install: apt-get install clang"; exit 1; }
 
+# Prefer cargo-installed bpf-linker over distro packages (e.g. Ubuntu often ships LLVM14;
+# nightly rustc emits LLVM22 bitcode → "Opaque pointers... Reader: LLVM 14.0.0").
+export PATH="${HOME}/.cargo/bin:${PATH}"
+
 # Ensure nightly is available for BPF target
 echo "→ Checking Rust nightly..."
 rustup toolchain install nightly --component rust-src 2>/dev/null || true
@@ -27,10 +31,23 @@ for _bpf_lib in /usr/lib64 /lib64 "/usr/lib/${_GNU_TRIPLE}" "/lib/${_GNU_TRIPLE}
 done
 export LD_LIBRARY_PATH
 
-# Install bpf-linker if not present
+# bpf-linker must embed the same LLVM generation as rustc nightly (bitcode compatibility).
+# Reinstall when nightly's LLVM version changes, or when FLOW_SENSOR_FORCE_BPF_LINKER=1.
+RUST_LLVM_VER="$(rustc +nightly -vV | sed -n 's/^LLVM version: //p')"
+BPF_LINKER_STAMP="${HOME}/.cargo/.flow-sensor-bpf-linker-llvm-version"
+_need_bpf_linker=false
 if ! command -v bpf-linker >/dev/null 2>&1; then
-    echo "→ Installing bpf-linker..."
-    cargo install bpf-linker
+    _need_bpf_linker=true
+elif [ ! -f "${BPF_LINKER_STAMP}" ] || ! grep -qxF "${RUST_LLVM_VER}" "${BPF_LINKER_STAMP}" 2>/dev/null; then
+    _need_bpf_linker=true
+fi
+if [ "${FLOW_SENSOR_FORCE_BPF_LINKER:-}" = 1 ]; then
+    _need_bpf_linker=true
+fi
+if [ "${_need_bpf_linker}" = true ]; then
+    echo "→ Installing/upgrading bpf-linker for rustc LLVM ${RUST_LLVM_VER}..."
+    cargo +nightly install bpf-linker --force --locked
+    printf '%s\n' "${RUST_LLVM_VER}" >"${BPF_LINKER_STAMP}"
 fi
 
 echo ""
