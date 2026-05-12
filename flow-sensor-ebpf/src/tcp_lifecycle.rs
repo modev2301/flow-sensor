@@ -17,29 +17,30 @@ use crate::{kread, maps::*};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Extract FlowKey from a kernel sock pointer
+/// Extract FlowKey from a `struct sock *` passed into TCP kprobes.
+///
+/// `sk` points at `struct sock`, not at `struct inet_sock`; fixed offsets from the
+/// sock base are wrong for `sk_protocol` on many kernels (you may see UDP/ garbage).
+/// These programs only attach to TCP hooks, so the 5-tuple protocol is always TCP.
 unsafe fn flow_key_from_sock(sk: *const core::ffi::c_void) -> Option<FlowKey> {
-    // Offsets into struct sock for common fields
-    // These are stable across kernel versions we support (5.8+)
-    const SK_SRC_IP_OFFSET: usize = 0x4;    // inet_sock.inet_saddr
-    const SK_DST_IP_OFFSET: usize = 0x0;    // inet_sock.inet_daddr
-    const SK_SRC_PORT_OFFSET: usize = 0xC;  // inet_sock.inet_sport
-    const SK_DST_PORT_OFFSET: usize = 0xA;  // inet_sock.inet_dport
-    const SK_PROTOCOL_OFFSET: usize = 0x10; // sk_protocol
+    const SK_SRC_IP_OFFSET: usize = 0x4; // intended: inet_saddr (see CO-RE note below)
+    const SK_DST_IP_OFFSET: usize = 0x0; // intended: inet_daddr
+    const SK_SRC_PORT_OFFSET: usize = 0xC; // inet_sport
+    const SK_DST_PORT_OFFSET: usize = 0xA; // inet_dport
 
     let base = sk.cast::<u8>();
     let src_ip = kread::read_u32_ne(base.add(SK_SRC_IP_OFFSET)).ok()?;
     let dst_ip = kread::read_u32_ne(base.add(SK_DST_IP_OFFSET)).ok()?;
     let src_port = kread::read_u16_ne(base.add(SK_SRC_PORT_OFFSET)).ok()?;
     let dst_port = kread::read_u16_ne(base.add(SK_DST_PORT_OFFSET)).ok()?;
-    let protocol = kread::read_u8(base.add(SK_PROTOCOL_OFFSET)).ok()?;
+    const IPPROTO_TCP: u8 = 6;
 
     Some(FlowKey {
         src_ip,
         dst_ip,
         src_port: u16::from_be(src_port),
         dst_port: u16::from_be(dst_port),
-        protocol,
+        protocol: IPPROTO_TCP,
         _pad: [0; 3],
     })
 }
