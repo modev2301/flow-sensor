@@ -9,7 +9,8 @@
 
 use flow_sensor_common::FlowEvent;
 use tokio::signal;
-use tracing::info;
+use std::io::Write;
+use tracing::{info, warn};
 
 use crate::{enricher, printer, EventFilter};
 
@@ -136,6 +137,13 @@ pub async fn event_loop(
             "json" | "jsonl" => printer::print_json(&enriched),
             _ => printer::print_pretty(&enriched),
         }
+        let _ = std::io::stdout().flush();
+    } else {
+        warn!(
+            "Synthetic stub event was filtered out (CLI filters apply in stub mode too). \
+             Try: omit --sample-rate / use --sample-rate 1, drop --ports / --retransmits-only, \
+             or lower --min-duration-ms (stub flow duration ≈ 1.5s)."
+        );
     }
 
     info!("Waiting for Ctrl+C...");
@@ -190,14 +198,16 @@ fn make_test_event() -> FlowEvent {
     e.http_status = 200;
 
     e.connect_ts_ns         = 0;
-    e.duration_ns           = 142_800_000;
+    // Long enough to pass typical --min-duration-ms; chain_id=0 passes any --sample-rate N>0.
+    e.duration_ns           = 1_500_000_000;
     e.time_to_first_byte_ns = 13_200_000;
     e.tls_handshake_ns      = 12_400_000;
     e.app_response_time_ns  = 48_200_000;
 
     e.close_reason = flow_sensor_common::CloseReason::Clean as u8;
 
-    e.chain_id        = 0xf7a2b1c3d4e5f601;
+    // Must be 0 mod N for default sampling rule (chain_id % sample_rate == 0), or stub vanishes.
+    e.chain_id          = 0;
     e.parent_chain_id = 0;
     e.chain_depth     = 0;
 
