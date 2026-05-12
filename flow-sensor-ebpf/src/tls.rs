@@ -16,10 +16,12 @@ use aya_ebpf::{
 };
 use flow_sensor_common::*;
 
-use crate::maps::{FlowKey, FLOW_TABLE, TLS_THREAD_FLOW};
+use crate::maps::{FLOW_TABLE, TLS_THREAD_FLOW};
 
-/// Max bytes copied from userspace per SSL hook (stack buffer; keep verifier-friendly).
-const TLS_SCRATCH_LEN: usize = 384;
+/// Max bytes copied from userspace per SSL hook.
+/// Keep small: the BPF stack is 512B by default; `ssl_write_return` must not hold scratch + full
+/// `HOST_LEN`/`PATH_LEN` copies at once (that produced invalid BPF / verifier "0 insns").
+const TLS_SCRATCH_LEN: usize = 256;
 
 /// `#[repr(C)]` with explicit padding so every byte is initialized on the stack.
 /// Implicit padding after `len` would leave holes and make `bpf_map_update_elem` fail verification.
@@ -85,27 +87,27 @@ unsafe fn handle_ssl_write_return(ctx: &RetProbeContext) -> Result<u32, i64> {
     };
     let _ = SSL_WRITE_ARGS.remove(&pid_tgid);
 
-    let read_len = (args.len as usize).min(TLS_SCRATCH_LEN);
-    let mut buf = [0u8; TLS_SCRATCH_LEN];
-    bpf_probe_read_user_buf(args.buf_ptr as *const u8, &mut buf[..read_len]).map_err(|e| e as i64)?;
-
     let flow_key = match TLS_THREAD_FLOW.get(&pid_tgid) {
         Some(k) => *k,
         None => return Ok(0),
     };
 
-    let mut tls_sni = [0u8; HOST_LEN];
-    let has_sni = parse_tls_clienthello_sni(&buf[..read_len], &mut tls_sni);
+    let Some(st) = FLOW_TABLE.get_ptr_mut(&flow_key) else {
+        return Ok(0);
+    };
 
-    let mut http_host = [0u8; HOST_LEN];
-    let mut http_method = [0u8; 8];
-    let mut http_path = [0u8; PATH_LEN];
+    let read_len = (args.len as usize).min(TLS_SCRATCH_LEN);
+    let mut buf = [0u8; TLS_SCRATCH_LEN];
+    bpf_probe_read_user_buf(args.buf_ptr as *const u8, &mut buf[..read_len]).map_err(|e| e as i64)?;
+
+    let has_sni = parse_tls_clienthello_sni(&buf[..read_len], &mut (*st).tls_sni);
+
     let mut has_http = 0u8;
     parse_http_request(
         &buf[..read_len],
-        &mut http_host,
-        &mut http_method,
-        &mut http_path,
+        &mut (*st).http_host,
+        &mut (*st).http_method,
+        &mut (*st).http_path,
         &mut has_http,
     );
 
@@ -113,21 +115,23 @@ unsafe fn handle_ssl_write_return(ctx: &RetProbeContext) -> Result<u32, i64> {
     if has_sni != 0 {
         has_tls = 1;
     } else if read_len >= 6 && buf[0] == 0x16 && buf[5] == 0x01 {
-        // TLS ClientHello record without parsed SNI (truncated or non-hostname)
         has_tls = 1;
     }
 
-    merge_tls_write_into_flow(
-        &flow_key,
-        &tls_sni,
-        has_sni,
-        has_tls,
-        &http_host,
-        &http_method,
-        &http_path,
-        has_http,
-        args.ts_ns,
-    );
+    if has_tls != 0 {
+        (*st).has_tls = 1;
+        if (*st).tls_ready_ts_ns == 0 {
+            (*st).tls_ready_ts_ns = bpf_ktime_get_ns();
+        }
+    }
+
+    if has_http != 0 {
+        (*st).has_http = 1;
+    }
+
+    if has_http != 0 || has_tls != 0 {
+        (*st).ssl_write_ts_ns = args.ts_ns;
+    }
 
     Ok(0)
 }
@@ -198,49 +202,11 @@ unsafe fn handle_ssl_read_return(ctx: &RetProbeContext) -> Result<u32, i64> {
     Ok(0)
 }
 
-unsafe fn merge_tls_write_into_flow(
-    flow_key: &FlowKey,
-    tls_sni: &[u8; HOST_LEN],
-    has_sni: u8,
-    has_tls: u8,
-    http_host: &[u8; HOST_LEN],
-    http_method: &[u8; 8],
-    http_path: &[u8; PATH_LEN],
-    has_http: u8,
-    write_ts_ns: u64,
-) {
-    let Some(st) = FLOW_TABLE.get_ptr_mut(flow_key) else {
-        return;
-    };
-
-    if has_tls != 0 {
-        (*st).has_tls = 1;
-        if (*st).tls_ready_ts_ns == 0 {
-            (*st).tls_ready_ts_ns = bpf_ktime_get_ns();
-        }
-    }
-
-    if has_sni != 0 {
-        (*st).tls_sni = *tls_sni;
-    }
-
-    if has_http != 0 {
-        (*st).has_http = 1;
-        (*st).http_host = *http_host;
-        (*st).http_method = *http_method;
-        (*st).http_path = *http_path;
-    }
-
-    if has_http != 0 || has_tls != 0 {
-        (*st).ssl_write_ts_ns = write_ts_ns;
-    }
-}
-
 // ── TLS ClientHello SNI (bounded) ───────────────────────────────────────────
 
 /// Returns `1` if a hostname was copied into `sni_out`.
 unsafe fn parse_tls_clienthello_sni(buf: &[u8], sni_out: &mut [u8; HOST_LEN]) -> u8 {
-    let max = buf.len().min(384);
+    let max = buf.len().min(TLS_SCRATCH_LEN);
     if max < 43 {
         return 0;
     }
