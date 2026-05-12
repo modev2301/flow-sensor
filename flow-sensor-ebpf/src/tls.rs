@@ -49,7 +49,9 @@ static SSL_READ_ARGS: HashMap<u64, SslArgs> = HashMap::with_max_entries(4096, 0)
 // Linux's BPF verifier runs `check_subprogs()` before simulating instructions. If LLVM emits
 // BPF-to-BPF calls, each subprogram's last insn must be EXIT or unconditional JA; otherwise the
 // kernel prints `last insn is not an exit or jmp` and then `processed 0 insns` (stats only).
-// `macro_rules!` forces a single subprogram for `ssl_write_return` / `ssl_read_return`.
+// `macro_rules!` keeps logic in one Rust `fn` per probe. Avoid **iterators and closures** in hot
+// paths: LLVM's BPF backend may outline those into BPF-to-BPF subprograms; Linux 5.15's
+// `check_subprogs()` rejects subprograms whose last insn is not `exit` or unconditional `ja`.
 
 macro_rules! parse_tls_clienthello_sni {
     ($buf:expr, $sni_out:expr) => {{
@@ -206,58 +208,87 @@ macro_rules! parse_http_request {
         let path_out: &mut [u8; PATH_LEN] = $path_out;
         let has_http: &mut u8 = $has_http;
         if buf.len() >= 4 {
-            let is_http = matches!(
-                (buf[0], buf[1], buf[2]),
-                (b'G', b'E', b'T')
-                    | (b'P', b'O', b'S')
-                    | (b'P', b'U', b'T')
-                    | (b'D', b'E', b'L')
-                    | (b'P', b'A', b'T')
-                    | (b'H', b'E', b'A')
-                    | (b'O', b'P', b'T')
-            );
+            let b0 = buf[0];
+            let b1 = buf[1];
+            let b2 = buf[2];
+            let is_http = (b0 == b'G' && b1 == b'E' && b2 == b'T')
+                || (b0 == b'P' && b1 == b'O' && b2 == b'S')
+                || (b0 == b'P' && b1 == b'U' && b2 == b'T')
+                || (b0 == b'D' && b1 == b'E' && b2 == b'L')
+                || (b0 == b'P' && b1 == b'A' && b2 == b'T')
+                || (b0 == b'H' && b1 == b'E' && b2 == b'A')
+                || (b0 == b'O' && b1 == b'P' && b2 == b'T');
             if is_http {
                 *has_http = 1;
-                let method_end = buf
-                    .iter()
-                    .position(|&b| b == b' ')
-                    .unwrap_or(7)
-                    .min(7);
-                method_out[..method_end].copy_from_slice(&buf[..method_end]);
-                if let Some(path_start) =
-                    buf.iter().position(|&b| b == b' ').map(|i| i + 1)
-                {
-                    let path_end = buf[path_start..]
-                        .iter()
-                        .position(|&b| b == b' ')
-                        .map(|i| i + path_start)
-                        .unwrap_or(path_start + PATH_LEN)
-                        .min(path_start + PATH_LEN);
-                    let copy_len = (path_end - path_start).min(PATH_LEN);
-                    path_out[..copy_len]
-                        .copy_from_slice(&buf[path_start..path_start + copy_len]);
+                let mut first_space: usize = buf.len();
+                let mut si = 0usize;
+                while si < buf.len() {
+                    if buf[si] == b' ' {
+                        first_space = si;
+                        break;
+                    }
+                    si += 1;
                 }
-                let host_prefix = b"Host: ";
-                let host_prefix_lower = b"host: ";
-                let mut i = 0usize;
-                while i < buf.len().saturating_sub(6) {
-                    if i >= 400 {
+                let method_end = if first_space == buf.len() {
+                    7usize
+                } else {
+                    core::cmp::min(first_space, 7)
+                };
+                let method_copy = core::cmp::min(method_end, buf.len());
+                method_out[..method_copy].copy_from_slice(&buf[..method_copy]);
+                if first_space < buf.len() {
+                    let path_start = first_space + 1;
+                    if path_start < buf.len() {
+                        let mut path_end =
+                            core::cmp::min(path_start.saturating_add(PATH_LEN), buf.len());
+                        let mut pj = path_start;
+                        while pj < buf.len() && pj < path_start + PATH_LEN {
+                            if buf[pj] == b' ' {
+                                path_end = pj;
+                                break;
+                            }
+                            pj += 1;
+                        }
+                        let copy_len = (path_end - path_start).min(PATH_LEN);
+                        path_out[..copy_len]
+                            .copy_from_slice(&buf[path_start..path_start + copy_len]);
+                    }
+                }
+                let mut hi = 0usize;
+                while hi < buf.len().saturating_sub(6) && hi < 400 {
+                    let h0 = buf[hi];
+                    let h1 = buf[hi + 1];
+                    let h2 = buf[hi + 2];
+                    let h3 = buf[hi + 3];
+                    let h4 = buf[hi + 4];
+                    let h5 = buf[hi + 5];
+                    let is_host_line = (h0 == b'H' || h0 == b'h')
+                        && (h1 == b'o' || h1 == b'O')
+                        && (h2 == b's' || h2 == b'S')
+                        && (h3 == b't' || h3 == b'T')
+                        && h4 == b':'
+                        && h5 == b' ';
+                    if is_host_line {
+                        let val_start = hi + 6;
+                        if val_start < buf.len() {
+                            let mut val_end =
+                                core::cmp::min(val_start.saturating_add(HOST_LEN), buf.len());
+                            let mut vj = val_start;
+                            while vj < buf.len() && vj < val_start + HOST_LEN {
+                                let c = buf[vj];
+                                if c == b'\r' || c == b'\n' {
+                                    val_end = vj;
+                                    break;
+                                }
+                                vj += 1;
+                            }
+                            let copy_len = (val_end - val_start).min(HOST_LEN);
+                            host_out[..copy_len]
+                                .copy_from_slice(&buf[val_start..val_start + copy_len]);
+                        }
                         break;
                     }
-                    if &buf[i..i + 6] == host_prefix || &buf[i..i + 6] == host_prefix_lower {
-                        let val_start = i + 6;
-                        let val_end = buf[val_start..]
-                            .iter()
-                            .position(|&b| b == b'\r' || b == b'\n')
-                            .map(|j| j + val_start)
-                            .unwrap_or(val_start + HOST_LEN)
-                            .min(val_start + HOST_LEN);
-                        let copy_len = (val_end - val_start).min(HOST_LEN);
-                        host_out[..copy_len]
-                            .copy_from_slice(&buf[val_start..val_start + copy_len]);
-                        break;
-                    }
-                    i += 1;
+                    hi += 1;
                 }
             }
         }
@@ -272,10 +303,15 @@ macro_rules! parse_http_status {
         } else if &buf[0..5] != b"HTTP/" {
             0u16
         } else {
-            let status_start = match buf[5..].iter().position(|&b| b == b' ') {
-                Some(i) => i + 6,
-                None => 0usize,
-            };
+            let mut status_start = 0usize;
+            let mut si = 5usize;
+            while si < buf.len() {
+                if buf[si] == b' ' {
+                    status_start = si + 1;
+                    break;
+                }
+                si += 1;
+            }
             if status_start == 0 || status_start + 3 > buf.len() {
                 0u16
             } else {
