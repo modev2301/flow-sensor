@@ -316,8 +316,12 @@ unsafe fn handle_ssl_write_entry(ctx: &ProbeContext) -> Result<u32, i64> {
 
 /// `SSL_write` return — keep **all** logic in this symbol. Splitting into a `handle_*` callee can
 /// produce a tiny BPF stub (~2 insns) that bpf-linker never merges with the body (aya-rs/aya#1056).
+///
+/// **Section name:** use a unique `uretprobe/...` per program. Plain `uretprobe` merges every
+/// return probe into one ELF section; on older kernels (e.g. 5.15) that can trip `check_subprogs`
+/// (`last insn is not an exit or jmp`) even when aya loads by symbol.
 #[no_mangle]
-#[link_section = "uretprobe"]
+#[link_section = "uretprobe/ssl_write_return"]
 pub unsafe fn ssl_write_return(ctx: *mut c_void) -> u32 {
     let ctx = RetProbeContext::new(ctx);
     let pid_tgid = bpf_get_current_pid_tgid();
@@ -411,7 +415,7 @@ unsafe fn handle_ssl_read_entry(ctx: &ProbeContext) -> Result<u32, i64> {
 }
 
 #[no_mangle]
-#[link_section = "uretprobe"]
+#[link_section = "uretprobe/ssl_read_return"]
 pub unsafe fn ssl_read_return(ctx: *mut c_void) -> u32 {
     let ctx = RetProbeContext::new(ctx);
     let pid_tgid = bpf_get_current_pid_tgid();
