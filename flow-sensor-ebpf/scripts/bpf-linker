@@ -1,12 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Cargo's bare linker name "bpf-linker" is resolved via PATH; distros often ship
-# an older bpf-linker (LLVM 14) that cannot read LLVM 22 bitcode from nightly rustc.
-_cargo_bin="${CARGO_HOME:-${HOME}/.cargo}/bin/bpf-linker"
-if ! [ -x "${_cargo_bin}" ]; then
-    echo "flow-sensor: missing ${_cargo_bin}" >&2
-    echo "Install: cargo +nightly install bpf-linker --force" >&2
-    echo "Or run ./build.sh from the repo root (it installs bpf-linker when needed)." >&2
-    exit 127
+# 1) Project-local linker (./build.sh installs here — avoids /usr/bin LLVM14 and stale ~/.cargo/bin).
+_script_dir="$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+_project_bpf="${_script_dir}/../.bpf-linker/bin/bpf-linker"
+if [ -n "${FLOW_SENSOR_BPF_LINKER:-}" ] && [ -x "${FLOW_SENSOR_BPF_LINKER}" ]; then
+    exec "${FLOW_SENSOR_BPF_LINKER}" "$@"
 fi
-exec "${_cargo_bin}" "$@"
+if [ -x "${_project_bpf}" ]; then
+    exec "${_project_bpf}" "$@"
+fi
+# 2) User-wide cargo bin (must be bpf-linker ≥0.10 with LLVM22, not distro package)
+_cargo_bin="${CARGO_HOME:-${HOME}/.cargo}/bin/bpf-linker"
+if [ -x "${_cargo_bin}" ]; then
+    exec "${_cargo_bin}" "$@"
+fi
+echo "flow-sensor: no usable bpf-linker found." >&2
+echo "  Tried: ${_project_bpf}" >&2
+echo "  Tried: ${_cargo_bin}" >&2
+echo "Run from repo root: ./build.sh   (installs LLVM22 bpf-linker under flow-sensor-ebpf/.bpf-linker/)" >&2
+exit 127

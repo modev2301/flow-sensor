@@ -34,27 +34,39 @@ single structured event per connection.
 - `CAP_BPF` + `CAP_NET_ADMIN` (or run as root)
 - Rust toolchain (stable + nightly for BPF target)
 - `clang` + `llvm` for BPF compilation
-- `bpf-linker` for linking BPF object
+- `bpf-linker` **0.10+ with LLVM 22** (not the Ubuntu `bpf-linker` package — it is often LLVM 14 and triggers “opaque pointers / Reader: LLVM 14” with current nightly)
 
 ## Build
+
+Prefer **`./build.sh`**: it installs a pinned **bpf-linker 0.10.3** with LLVM 22 under `flow-sensor-ebpf/.bpf-linker/` and points Cargo at that binary so `/usr/bin/bpf-linker` is never used.
+
+```bash
+chmod +x build.sh && ./build.sh
+```
+
+If you still see `Reader: LLVM 14.0.0`, remove the distro package (`apt remove bpf-linker`) and run `FLOW_SENSOR_FORCE_BPF_LINKER=1 ./build.sh` to reinstall the project-local linker.
+
+### Manual steps (without `build.sh`)
 
 ```bash
 # 1. Install Rust (if not already installed)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# 2. Add BPF target (requires nightly for the BPF target)
-rustup toolchain install nightly
-rustup target add --toolchain nightly bpfel-unknown-none
-
-# 3. Install bpf-linker (must match nightly’s LLVM; avoid distro /usr/bin bpf-linker, often LLVM 14)
+# 2. Nightly + BPF target + rust-src (required for -Z build-std=core)
 rustup toolchain install nightly --component rust-src
 rustup target add --toolchain nightly bpfel-unknown-none
-cargo +nightly install bpf-linker --force
+
+# 3. Project-local bpf-linker (matches nightly LLVM; avoids /usr/bin)
+mkdir -p flow-sensor-ebpf/.bpf-linker
+cargo +nightly install bpf-linker --version 0.10.3 --force --locked \
+    --no-default-features --features rust-llvm-22,llvm-22 \
+    --root flow-sensor-ebpf/.bpf-linker
 
 # 4. Install clang/llvm (Ubuntu/Debian)
 apt-get install -y clang llvm libbpf-dev linux-headers-$(uname -r)
 
-# 5. Build the eBPF programs (crate is excluded from the workspace — use --manifest-path)
+# 5. Build eBPF (from repo root; linker path must be this LLVM22 binary)
+export CARGO_TARGET_BPFEL_UNKNOWN_NONE_LINKER="$PWD/flow-sensor-ebpf/.bpf-linker/bin/bpf-linker"
 cargo +nightly build --manifest-path flow-sensor-ebpf/Cargo.toml \
     --target bpfel-unknown-none \
     -Z build-std=core \
@@ -65,12 +77,6 @@ cargo build --package flow-sensor --release
 
 # The final binary is at:
 # target/release/flow-sensor
-```
-
-### Quick build script
-
-```bash
-chmod +x build.sh && ./build.sh
 ```
 
 ## Run

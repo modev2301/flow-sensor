@@ -3,3 +3,4 @@ target/
 .qodo/
 .dist/
 mnt/
+flow-sensor-ebpf/.bpf-linker/
