@@ -21,6 +21,8 @@ fi
 
 echo ""
 echo "→ Building eBPF programs (kernel space)..."
+# bpf-linker loads the same libLLVM as nightly rustc; some distros need this on PATH.
+export LD_LIBRARY_PATH="$(rustc +nightly --print sysroot)/lib:${LD_LIBRARY_PATH:-}"
 cargo +nightly build \
     --manifest-path flow-sensor-ebpf/Cargo.toml \
     --target bpfel-unknown-none \

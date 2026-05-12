@@ -15,12 +15,6 @@ use crate::{kread, maps::*};
 pub(crate) const TCP_SRTT_US_OFFSET: usize = 0x1E0; // srtt_us (smoothed RTT << 3)
 const TCP_RTTVAR_US_OFFSET: usize = 0x1E4; // rttvar_us (variance << 2)
 const TCP_SND_CWND_OFFSET: usize = 0x1AC;   // snd_cwnd
-const TCP_RCV_WND_OFFSET: usize = 0x244;    // rcv_wnd
-const TCP_LOST_OUT_OFFSET: usize = 0x1C8;   // lost_out
-const TCP_RETRANS_OUT_OFFSET: usize = 0x1CC; // retrans_out
-const TCP_SACKED_OUT_OFFSET: usize = 0x1D0; // sacked_out
-const TCP_BYTES_ACKED_OFFSET: usize = 0x2C8; // bytes_acked
-const TCP_BYTES_RETRANS_OFFSET: usize = 0x2D0; // bytes_retrans
 const TCP_ICSK_CA_STATE_OFFSET: usize = 0x164; // inet_csk.icsk_ca_state
 
 /// Fires on every established TCP ACK received.

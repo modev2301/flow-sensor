@@ -11,7 +11,6 @@ use crate::{kread, maps::*};
 use crate::tcp_quality::flow_key_from_sk;
 
 // Offsets into tcp_sock for retransmit-related fields
-const TCP_RTO_OFFSET: usize = 0x1B8;        // icsk_rto (in jiffies, but we use srtt)
 const TCP_SND_UNA_OFFSET: usize = 0x188;    // snd_una (last unacked)
 const TCP_SND_NXT_OFFSET: usize = 0x18C;    // snd_nxt (next to send)
 

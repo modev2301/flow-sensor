@@ -1,2 +1,5 @@
 [target.bpfel-unknown-none]
 linker = "bpf-linker"
+# FlowState + FlowEvent and TLS scratch buffers exceed the default BPF stack (~512).
+# LLVM BPF codegen; kernel verifier still enforces its own cap at load time.
+rustflags = ["-Cllvm-args=-bpf-stack-size=65536"]
