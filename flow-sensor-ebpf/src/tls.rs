@@ -21,11 +21,14 @@ use crate::maps::{FlowKey, FLOW_TABLE, TLS_THREAD_FLOW};
 /// Max bytes copied from userspace per SSL hook (stack buffer; keep verifier-friendly).
 const TLS_SCRATCH_LEN: usize = 384;
 
+/// `#[repr(C)]` with explicit padding so every byte is initialized on the stack.
+/// Implicit padding after `len` would leave holes and make `bpf_map_update_elem` fail verification.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SslArgs {
     buf_ptr: u64,
     len: u32,
+    _pad: u32,
     ts_ns: u64,
 }
 
@@ -53,6 +56,7 @@ unsafe fn handle_ssl_write_entry(ctx: &ProbeContext) -> Result<u32, i64> {
     let args = SslArgs {
         buf_ptr,
         len,
+        _pad: 0,
         ts_ns: bpf_ktime_get_ns(),
     };
     SSL_WRITE_ARGS.insert(&pid_tgid, &args, 0)?;
@@ -144,6 +148,7 @@ unsafe fn handle_ssl_read_entry(ctx: &ProbeContext) -> Result<u32, i64> {
     let args = SslArgs {
         buf_ptr,
         len,
+        _pad: 0,
         ts_ns: bpf_ktime_get_ns(),
     };
     SSL_READ_ARGS.insert(&pid_tgid, &args, 0)?;
