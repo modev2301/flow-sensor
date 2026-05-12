@@ -76,11 +76,12 @@ export CARGO_TARGET_BPFEL_UNKNOWN_NONE_LINKER="${BPF_LINKER_BIN}"
 export FLOW_SENSOR_BPF_LINKER="${BPF_LINKER_BIN}"
 # RUSTFLAGS only for this crate: do not pass BPF llvm-args to the host userspace build below.
 env LD_LIBRARY_PATH="${_base_lp}" \
-    RUSTFLAGS="${RUSTFLAGS:-} -Cllvm-args=-bpf-stack-size=1048576 -Clink-arg=--llvm-args=--bpf-stack-size=1048576" \
+    RUSTFLAGS="${RUSTFLAGS:-} -Cllvm-args=-bpf-stack-size=1048576 -Cllvm-args=--bpf-expand-memcpy-in-order '-Clink-arg=--llvm-args=--bpf-stack-size=1048576 --bpf-expand-memcpy-in-order'" \
     cargo +nightly build \
     --manifest-path flow-sensor-ebpf/Cargo.toml \
     --target bpfel-unknown-none \
     -Z build-std=core \
+    -Z build-std-features=panic_immediate_abort \
     --release 2>&1
 
 echo ""

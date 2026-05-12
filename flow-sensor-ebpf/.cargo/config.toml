@@ -2,5 +2,8 @@
 linker = "scripts/bpf-linker"
 rustflags = [
     "-C", "llvm-args=-bpf-stack-size=1048576",
-    "-C", "link-arg=--llvm-args=--bpf-stack-size=1048576",
+    # Expand memcpy/memset to ordered loads/stores during codegen so LLVM does not leave helper
+    # stubs after `exit` (Linux 5.15 verifier: last insn must be exit or unconditional ja).
+    "-C", "llvm-args=--bpf-expand-memcpy-in-order",
+    "-C", "link-arg=--llvm-args=--bpf-stack-size=1048576 --bpf-expand-memcpy-in-order",
 ]

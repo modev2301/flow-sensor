@@ -4,5 +4,6 @@ linker = "flow-sensor-ebpf/scripts/bpf-linker"
 # rustc codegen + bpf-linker's own LLVM pass (link step) both need a larger BPF stack.
 rustflags = [
     "-C", "llvm-args=-bpf-stack-size=1048576",
-    "-C", "link-arg=--llvm-args=--bpf-stack-size=1048576",
+    "-C", "llvm-args=--bpf-expand-memcpy-in-order",
+    "-C", "link-arg=--llvm-args=--bpf-stack-size=1048576 --bpf-expand-memcpy-in-order",
 ]
