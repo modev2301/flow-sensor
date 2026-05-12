@@ -1,6 +1,8 @@
 //! TCP connection lifecycle hooks.
 //! Tracks connect, accept, and close to bookend every flow event.
 
+use core::mem::MaybeUninit;
+
 use aya_ebpf::{
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
@@ -161,81 +163,94 @@ unsafe fn handle_tcp_close(ctx: &ProbeContext) -> Result<u32, i64> {
     let sk = ctx.arg::<*const core::ffi::c_void>(0).ok_or(-1)?;
     let key = flow_key_from_sock(sk).ok_or(-1)?;
 
-    // Borrow from the map so we never copy a full `FlowState` onto the stack.
-    let event = {
-        let Some(state) = FLOW_TABLE.get(&key) else {
-            return Ok(0);
-        };
-        let now = bpf_ktime_get_ns();
-        let duration_ns = now.saturating_sub(state.connect_ts_ns);
-        FlowEvent {
-            pid: state.pid,
-            ppid: state.ppid,
-            uid: state.uid,
-            gid: state.gid,
-            comm: state.comm,
-            cgroup: state.cgroup,
-            src_ip: key.src_ip,
-            dst_ip: key.dst_ip,
-            src_port: key.src_port,
-            dst_port: key.dst_port,
-            protocol: key.protocol,
-            direction: state.direction,
-            bytes_sent: state.bytes_sent,
-            bytes_recv: state.bytes_recv,
-            pkts_sent: state.pkts_sent,
-            pkts_recv: state.pkts_recv,
-            srtt_us_min: if state.srtt_us_min == u32::MAX { 0 } else { state.srtt_us_min },
-            srtt_us_max: state.srtt_us_max,
-            srtt_us_final: state.srtt_us_last,
-            rttvar_us_max: state.rttvar_us_max,
-            retransmit_count: state.retransmit_count,
-            retransmit_bytes: state.retransmit_bytes,
-            retransmit_rto_count: state.retransmit_rto_count,
-            retransmit_fast_count: state.retransmit_fast_count,
-            retransmit_tlp_count: state.retransmit_tlp_count,
-            sack_blocks_received: state.sack_blocks_received,
-            cwnd_min: if state.cwnd_min == u32::MAX { 0 } else { state.cwnd_min },
-            cwnd_max: state.cwnd_max,
-            ecn_signals: state.ecn_signals,
-            tls_sni: state.tls_sni,
-            http_host: state.http_host,
-            http_method: state.http_method,
-            http_path: state.http_path,
-            http_status: state.http_status,
-            has_tls: state.has_tls,
-            has_http: state.has_http,
-            connect_ts_ns: state.connect_ts_ns,
-            first_byte_ts_ns: state.first_byte_ts_ns,
-            first_recv_ts_ns: state.first_recv_ts_ns,
-            close_ts_ns: now,
-            duration_ns,
-            time_to_first_byte_ns: state.first_byte_ts_ns.saturating_sub(state.connect_ts_ns),
-            tls_handshake_ns: if state.tls_ready_ts_ns > 0 {
-                state.tls_ready_ts_ns.saturating_sub(state.connect_ts_ns)
-            } else {
-                0
-            },
-            app_response_time_ns: if state.first_recv_ts_ns > 0 && state.ssl_write_ts_ns > 0 {
-                state.first_recv_ts_ns.saturating_sub(state.ssl_write_ts_ns)
-            } else {
-                0
-            },
-            close_reason: CloseReason::LocalClose as u8,
-            congestion_state_final: state.congestion_state_final,
-            chain_id: state.chain_id,
-            parent_chain_id: state.parent_chain_id,
-            chain_depth: state.chain_depth,
-        }
+    let Some(state) = FLOW_TABLE.get(&key) else {
+        return Ok(0);
     };
+    let now = bpf_ktime_get_ns();
+    let duration_ns = now.saturating_sub(state.connect_ts_ns);
 
-    if let Some(mut buf) = FLOW_EVENTS.reserve::<FlowEvent>(0) {
-        buf.write(event);
-        buf.submit(0);
-    }
+    // Never build a `FlowEvent` on the BPF stack (~900B): verifier caps stack (~512B).
+    // Reserve ringbuf memory first, then fill in place (off-stack).
+    let Some(mut entry) = FLOW_EVENTS.reserve::<FlowEvent>(0) else {
+        return Ok(0);
+    };
+    let e = MaybeUninit::as_mut_ptr(&mut *entry);
+    core::ptr::write_bytes(e as *mut u8, 0, core::mem::size_of::<FlowEvent>());
+
+    (*e).pid = state.pid;
+    (*e).ppid = state.ppid;
+    (*e).uid = state.uid;
+    (*e).gid = state.gid;
+    (*e).comm = state.comm;
+    (*e).cgroup = state.cgroup;
+    (*e).src_ip = key.src_ip;
+    (*e).dst_ip = key.dst_ip;
+    (*e).src_port = key.src_port;
+    (*e).dst_port = key.dst_port;
+    (*e).protocol = key.protocol;
+    (*e).direction = state.direction;
+    (*e).bytes_sent = state.bytes_sent;
+    (*e).bytes_recv = state.bytes_recv;
+    (*e).pkts_sent = state.pkts_sent;
+    (*e).pkts_recv = state.pkts_recv;
+    (*e).srtt_us_min = if state.srtt_us_min == u32::MAX {
+        0
+    } else {
+        state.srtt_us_min
+    };
+    (*e).srtt_us_max = state.srtt_us_max;
+    (*e).srtt_us_final = state.srtt_us_last;
+    (*e).rttvar_us_max = state.rttvar_us_max;
+    (*e).retransmit_count = state.retransmit_count;
+    (*e).retransmit_bytes = state.retransmit_bytes;
+    (*e).retransmit_rto_count = state.retransmit_rto_count;
+    (*e).retransmit_fast_count = state.retransmit_fast_count;
+    (*e).retransmit_tlp_count = state.retransmit_tlp_count;
+    (*e).sack_blocks_received = state.sack_blocks_received;
+    (*e).cwnd_min = if state.cwnd_min == u32::MAX {
+        0
+    } else {
+        state.cwnd_min
+    };
+    (*e).cwnd_max = state.cwnd_max;
+    (*e).ecn_signals = state.ecn_signals;
+    (*e).tls_sni = state.tls_sni;
+    (*e).http_host = state.http_host;
+    (*e).http_method = state.http_method;
+    (*e).http_path = state.http_path;
+    (*e).http_status = state.http_status;
+    (*e).has_tls = state.has_tls;
+    (*e).has_http = state.has_http;
+    (*e).connect_ts_ns = state.connect_ts_ns;
+    (*e).first_byte_ts_ns = state.first_byte_ts_ns;
+    (*e).first_recv_ts_ns = state.first_recv_ts_ns;
+    (*e).close_ts_ns = now;
+    (*e).duration_ns = duration_ns;
+    (*e).time_to_first_byte_ns = state
+        .first_byte_ts_ns
+        .saturating_sub(state.connect_ts_ns);
+    (*e).tls_handshake_ns = if state.tls_ready_ts_ns > 0 {
+        state.tls_ready_ts_ns.saturating_sub(state.connect_ts_ns)
+    } else {
+        0
+    };
+    (*e).app_response_time_ns = if state.first_recv_ts_ns > 0 && state.ssl_write_ts_ns > 0 {
+        state
+            .first_recv_ts_ns
+            .saturating_sub(state.ssl_write_ts_ns)
+    } else {
+        0
+    };
+    (*e).close_reason = CloseReason::LocalClose as u8;
+    (*e).congestion_state_final = state.congestion_state_final;
+    (*e).chain_id = state.chain_id;
+    (*e).parent_chain_id = state.parent_chain_id;
+    (*e).chain_depth = state.chain_depth;
+
+    entry.submit(0);
 
     FLOW_TABLE.remove(&key)?;
-    Ok(0)
+    Ok(())
 }
 
 // ── TCP RST handling ─────────────────────────────────────────────────────────
