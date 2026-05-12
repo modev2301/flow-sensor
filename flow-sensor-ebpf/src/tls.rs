@@ -67,44 +67,42 @@ unsafe fn handle_ssl_write_entry(ctx: &ProbeContext) -> Result<u32, i64> {
     Ok(0)
 }
 
-/// `SSL_write` return — manual section (avoid `#[uretprobe]` macro: nested same-name `fn` + trailing
-/// `return 0` has produced invalid BPF / verifier "last insn is not an exit", 0 insns).
+/// `SSL_write` return — keep **all** logic in this symbol. Splitting into a `handle_*` callee can
+/// produce a tiny BPF stub (~2 insns) that bpf-linker never merges with the body (aya-rs/aya#1056).
 #[no_mangle]
 #[link_section = "uretprobe"]
 pub unsafe fn ssl_write_return(ctx: *mut c_void) -> u32 {
     let ctx = RetProbeContext::new(ctx);
-    match handle_ssl_write_return(&ctx) {
-        Ok(ret) => ret,
-        Err(_) => 0,
-    }
-}
-
-unsafe fn handle_ssl_write_return(ctx: &RetProbeContext) -> Result<u32, i64> {
     let pid_tgid = bpf_get_current_pid_tgid();
-    let ret = ctx.ret::<i32>().ok_or(-1)?;
+    let ret = match ctx.ret::<i32>() {
+        Some(r) => r,
+        None => return 0,
+    };
     if ret <= 0 {
         let _ = SSL_WRITE_ARGS.remove(&pid_tgid);
-        return Ok(0);
+        return 0;
     }
 
     let args = match SSL_WRITE_ARGS.get(&pid_tgid) {
         Some(a) => *a,
-        None => return Ok(0),
+        None => return 0,
     };
     let _ = SSL_WRITE_ARGS.remove(&pid_tgid);
 
     let flow_key = match TLS_THREAD_FLOW.get(&pid_tgid) {
         Some(k) => *k,
-        None => return Ok(0),
+        None => return 0,
     };
 
     let Some(st) = FLOW_TABLE.get_ptr_mut(&flow_key) else {
-        return Ok(0);
+        return 0;
     };
 
     let read_len = (args.len as usize).min(TLS_SCRATCH_LEN);
     let mut buf = [0u8; TLS_SCRATCH_LEN];
-    bpf_probe_read_user_buf(args.buf_ptr as *const u8, &mut buf[..read_len]).map_err(|e| e as i64)?;
+    if bpf_probe_read_user_buf(args.buf_ptr as *const u8, &mut buf[..read_len]).is_err() {
+        return 0;
+    }
 
     let has_sni = parse_tls_clienthello_sni(&buf[..read_len], &mut (*st).tls_sni);
 
@@ -139,7 +137,7 @@ unsafe fn handle_ssl_write_return(ctx: &RetProbeContext) -> Result<u32, i64> {
         (*st).ssl_write_ts_ns = args.ts_ns;
     }
 
-    Ok(0)
+    0
 }
 
 /// SSL_read(SSL *ssl, void *buf, int num)
@@ -169,50 +167,49 @@ unsafe fn handle_ssl_read_entry(ctx: &ProbeContext) -> Result<u32, i64> {
 #[link_section = "uretprobe"]
 pub unsafe fn ssl_read_return(ctx: *mut c_void) -> u32 {
     let ctx = RetProbeContext::new(ctx);
-    match handle_ssl_read_return(&ctx) {
-        Ok(ret) => ret,
-        Err(_) => 0,
-    }
-}
-
-unsafe fn handle_ssl_read_return(ctx: &RetProbeContext) -> Result<u32, i64> {
     let pid_tgid = bpf_get_current_pid_tgid();
-    let ret = ctx.ret::<i32>().ok_or(-1)?;
+    let ret = match ctx.ret::<i32>() {
+        Some(r) => r,
+        None => return 0,
+    };
     if ret <= 0 {
         let _ = SSL_READ_ARGS.remove(&pid_tgid);
-        return Ok(0);
+        return 0;
     }
 
     let args = match SSL_READ_ARGS.get(&pid_tgid) {
         Some(a) => *a,
-        None => return Ok(0),
+        None => return 0,
     };
     let _ = SSL_READ_ARGS.remove(&pid_tgid);
 
     let read_len = (ret as usize).min(TLS_SCRATCH_LEN);
     let mut buf = [0u8; TLS_SCRATCH_LEN];
-    bpf_probe_read_user_buf(args.buf_ptr as *const u8, &mut buf[..read_len]).map_err(|e| e as i64)?;
+    if bpf_probe_read_user_buf(args.buf_ptr as *const u8, &mut buf[..read_len]).is_err() {
+        return 0;
+    }
 
     let flow_key = match TLS_THREAD_FLOW.get(&pid_tgid) {
         Some(k) => *k,
-        None => return Ok(0),
+        None => return 0,
     };
 
     let status = parse_http_status(&buf[..read_len]);
     if status == 0 {
-        return Ok(0);
+        return 0;
     }
 
     let Some(st) = FLOW_TABLE.get_ptr_mut(&flow_key) else {
-        return Ok(0);
+        return 0;
     };
     (*st).http_status = status;
-    Ok(0)
+    0
 }
 
 // ── TLS ClientHello SNI (bounded) ───────────────────────────────────────────
 
 /// Returns `1` if a hostname was copied into `sni_out`.
+#[inline(always)]
 unsafe fn parse_tls_clienthello_sni(buf: &[u8], sni_out: &mut [u8; HOST_LEN]) -> u8 {
     let max = buf.len().min(TLS_SCRATCH_LEN);
     if max < 43 {
@@ -302,6 +299,7 @@ unsafe fn parse_tls_clienthello_sni(buf: &[u8], sni_out: &mut [u8; HOST_LEN]) ->
     0
 }
 
+#[inline(always)]
 unsafe fn parse_sni_extension(ep: &[u8], sni_out: &mut [u8; HOST_LEN]) -> u8 {
     if ep.len() < 5 {
         return 0;
@@ -329,6 +327,7 @@ unsafe fn parse_sni_extension(ep: &[u8], sni_out: &mut [u8; HOST_LEN]) -> u8 {
 
 // ── HTTP parser (minimal, BPF-safe) ─────────────────────────────────────────
 
+#[inline(always)]
 unsafe fn parse_http_request(
     buf: &[u8],
     host_out: &mut [u8; HOST_LEN],
@@ -396,6 +395,7 @@ unsafe fn parse_http_request(
     }
 }
 
+#[inline(always)]
 unsafe fn parse_http_status(buf: &[u8]) -> u16 {
     if buf.len() < 12 {
         return 0;

@@ -11,3 +11,10 @@ crate-type = ["cdylib"]
 [dependencies]
 aya-ebpf = { version = "0.1.1", default-features = false }
 flow-sensor-common = { path = "../flow-sensor-common", default-features = false }
+
+# Aggressive LTO can interact badly with bpf-linker: uretprobe entry may become a tiny stub while
+# the real body is a separate BPF subprogram (verifier: "last insn is not an exit", 0 insns).
+[profile.release]
+lto = false
+opt-level = 3
+codegen-units = 1
