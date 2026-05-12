@@ -10,7 +10,7 @@ command -v clang >/dev/null 2>&1 || { echo "❌ clang not found. Install: apt-ge
 
 # Prefer cargo-installed bpf-linker over distro packages (e.g. Ubuntu often ships LLVM14;
 # nightly rustc emits LLVM22 bitcode → "Opaque pointers... Reader: LLVM 14.0.0").
-export PATH="${HOME}/.cargo/bin:${PATH}"
+export PATH="${CARGO_HOME:-${HOME}/.cargo}/bin:${PATH}"
 
 # Ensure nightly is available for BPF target
 echo "→ Checking Rust nightly..."
@@ -34,7 +34,7 @@ export LD_LIBRARY_PATH
 # bpf-linker must embed the same LLVM generation as rustc nightly (bitcode compatibility).
 # Reinstall when nightly's LLVM version changes, or when FLOW_SENSOR_FORCE_BPF_LINKER=1.
 RUST_LLVM_VER="$(rustc +nightly -vV | sed -n 's/^LLVM version: //p')"
-BPF_LINKER_STAMP="${HOME}/.cargo/.flow-sensor-bpf-linker-llvm-version"
+BPF_LINKER_STAMP="${CARGO_HOME:-${HOME}/.cargo}/.flow-sensor-bpf-linker-llvm-version"
 _need_bpf_linker=false
 if ! command -v bpf-linker >/dev/null 2>&1; then
     _need_bpf_linker=true
@@ -52,6 +52,8 @@ fi
 
 echo ""
 echo "→ Building eBPF programs (kernel space)..."
+# Cargo env overrides config; never resolve bare "bpf-linker" from PATH (distro LLVM 14).
+export CARGO_TARGET_BPFEL_UNKNOWN_NONE_LINKER="${CARGO_HOME:-${HOME}/.cargo}/bin/bpf-linker"
 # RUSTFLAGS only for this crate: do not pass BPF llvm-args to the host userspace build below.
 env RUSTFLAGS="${RUSTFLAGS:-} -Cllvm-args=-bpf-stack-size=1048576 -Clink-arg=--llvm-args=--bpf-stack-size=1048576" \
     cargo +nightly build \

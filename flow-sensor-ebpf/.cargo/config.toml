@@ -1,5 +1,5 @@
 [target.bpfel-unknown-none]
-linker = "bpf-linker"
+linker = "scripts/bpf-linker"
 rustflags = [
     "-C", "llvm-args=-bpf-stack-size=1048576",
     "-C", "link-arg=--llvm-args=--bpf-stack-size=1048576",

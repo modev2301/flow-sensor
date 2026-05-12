@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Cargo's bare linker name "bpf-linker" is resolved via PATH; distros often ship
+# an older bpf-linker (LLVM 14) that cannot read LLVM 22 bitcode from nightly rustc.
+_cargo_bin="${CARGO_HOME:-${HOME}/.cargo}/bin/bpf-linker"
+if ! [ -x "${_cargo_bin}" ]; then
+    echo "flow-sensor: missing ${_cargo_bin}" >&2
+    echo "Install: cargo +nightly install bpf-linker --force" >&2
+    echo "Or run ./build.sh from the repo root (it installs bpf-linker when needed)." >&2
+    exit 127
+fi
+exec "${_cargo_bin}" "$@"

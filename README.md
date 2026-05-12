@@ -46,14 +46,16 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 rustup toolchain install nightly
 rustup target add --toolchain nightly bpfel-unknown-none
 
-# 3. Install bpf-linker
-cargo install bpf-linker
+# 3. Install bpf-linker (must match nightly’s LLVM; avoid distro /usr/bin bpf-linker, often LLVM 14)
+rustup toolchain install nightly --component rust-src
+rustup target add --toolchain nightly bpfel-unknown-none
+cargo +nightly install bpf-linker --force
 
 # 4. Install clang/llvm (Ubuntu/Debian)
 apt-get install -y clang llvm libbpf-dev linux-headers-$(uname -r)
 
-# 5. Build the eBPF programs (must be compiled with nightly for BPF target)
-cargo +nightly build --package flow-sensor-ebpf \
+# 5. Build the eBPF programs (crate is excluded from the workspace — use --manifest-path)
+cargo +nightly build --manifest-path flow-sensor-ebpf/Cargo.toml \
     --target bpfel-unknown-none \
     -Z build-std=core \
     --release

@@ -1,5 +1,6 @@
 [target.bpfel-unknown-none]
-linker = "bpf-linker"
+# Do not use bare "bpf-linker" — PATH may pick distro LLVM14 vs nightly LLVM22.
+linker = "flow-sensor-ebpf/scripts/bpf-linker"
 # rustc codegen + bpf-linker's own LLVM pass (link step) both need a larger BPF stack.
 rustflags = [
     "-C", "llvm-args=-bpf-stack-size=1048576",
