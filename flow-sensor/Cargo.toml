@@ -20,3 +20,4 @@ nix = { version = "=0.27.1", features = ["user"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { version = "0.13.1", features = ["async_tokio"] }
+aya-obj = { version = "0.2.1", features = ["std"] }

@@ -25,7 +25,8 @@ mod live {
         ring: RingBuf<aya::maps::MapData>,
     }
 
-    fn ebpf_object_path() -> PathBuf {
+    /// Path to the linked BPF shared object (same file `Ebpf::load` reads).
+    pub fn ebpf_object_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
             "../flow-sensor-ebpf/target/bpfel-unknown-none/release/libflow_sensor_ebpf.so",
         )
@@ -134,7 +135,7 @@ mod live {
 }
 
 #[cfg(target_os = "linux")]
-pub use live::{event_loop, load_and_attach, BpfHandle};
+pub use live::{ebpf_object_path, event_loop, load_and_attach, BpfHandle};
 
 // ── Non-Linux: stub ───────────────────────────────────────────────────────────
 

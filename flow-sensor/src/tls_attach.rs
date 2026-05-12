@@ -7,6 +7,66 @@
 use crate::loader::BpfHandle;
 use tracing::{debug, info, warn};
 
+/// TLS uprobes we attach to libssl — must match ELF program names.
+#[cfg(target_os = "linux")]
+const TLS_EBPF_PROGRAMS: &[&str] = &[
+    "ssl_write_entry",
+    "ssl_write_return",
+    "ssl_read_entry",
+    "ssl_read_return",
+];
+
+/// Parse the on-disk BPF `.so` with `aya-obj` and log each TLS program's instruction count.
+///
+/// **Fact:** the kernel verifier line `processed 0 insns` means the program passed to
+/// `BPF_PROG_LOAD` has **zero instructions** in `attr->insn_cnt` (nothing to verify). That is
+/// distinct from a verifier rejection inside a non-empty program.
+///
+/// If the ELF already has `instructions.len() == 0` for `ssl_write_return`, the failure is
+/// determined **before** the verifier runs meaningful analysis — fix the BPF link / object, not
+/// individual verifier rules.
+#[cfg(target_os = "linux")]
+fn assert_tls_programs_non_empty_elf(so_path: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::fs;
+    use aya_obj::Object;
+
+    let data = fs::read(so_path).with_context(|| format!("read BPF object {}", so_path.display()))?;
+    let obj = Object::parse(&data).with_context(|| format!("aya_obj::Object::parse {}", so_path.display()))?;
+
+    for &name in TLS_EBPF_PROGRAMS {
+        let prog = obj
+            .programs
+            .get(name)
+            .with_context(|| format!("ELF missing BPF program `{name}` (wrong object path or stale build?)"))?;
+        let key = prog.function_key();
+        let func = obj.functions.get(&key).with_context(|| format!(
+            "ELF program `{name}` has no linked Function at (section_index={}, address={:#x})",
+            key.0, key.1
+        ))?;
+        let n = func.instructions.len();
+        info!(
+            program = %name,
+            insn_count = n,
+            path = %so_path.display(),
+            "TLS program instruction count from ELF (pre-BPF_PROG_LOAD)"
+        );
+        if n == 0 {
+            anyhow::bail!(
+                "BPF object `{}`: program `{}` has **0 instructions** in the ELF that aya_obj parsed. \
+The kernel then fails BPF_PROG_LOAD with verifier text like `processed 0 insns` and `last insn is not an exit` (EINVAL). \
+This is not a semantic verifier failure inside a real program — the loaded bytecode is empty. \
+Rebuild `flow-sensor-ebpf` (release, target `bpfel-unknown-none`) and confirm this log shows insn_count > 0. \
+You can cross-check with: llvm-objdump --section-headers {}",
+                so_path.display(),
+                name,
+                so_path.display(),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Common libssl paths across Linux distros
 const LIBSSL_PATHS: &[&str] = &[
     "/usr/lib/x86_64-linux-gnu/libssl.so.3",
@@ -52,12 +112,7 @@ fn load_tls_programs(bpf: &mut aya::Ebpf) -> anyhow::Result<()> {
     use anyhow::Context;
     use aya::programs::UProbe;
 
-    for prog_name in [
-        "ssl_write_entry",
-        "ssl_write_return",
-        "ssl_read_entry",
-        "ssl_read_return",
-    ] {
+    for prog_name in TLS_EBPF_PROGRAMS {
         let program = bpf
             .program_mut(prog_name)
             .ok_or_else(|| anyhow::anyhow!("BPF program `{prog_name}` not found"))?;
@@ -84,6 +139,9 @@ pub async fn attach_tls_probes(handle: &mut BpfHandle, pids: &[u32]) -> anyhow::
         ("ssl_read_entry", "SSL_read"),
         ("ssl_read_return", "SSL_read"),
     ];
+
+    let so_path = crate::loader::ebpf_object_path();
+    assert_tls_programs_non_empty_elf(&so_path).context("TLS BPF ELF inspection failed")?;
 
     load_tls_programs(&mut handle.bpf).context("load TLS BPF programs")?;
 
