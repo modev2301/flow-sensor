@@ -1,0 +1,13 @@
+[package]
+name = "flow-sensor-ebpf"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+aya-ebpf = { version = "0.1.1", default-features = false }
+flow-sensor-common = { path = "../flow-sensor-common", default-features = false }
