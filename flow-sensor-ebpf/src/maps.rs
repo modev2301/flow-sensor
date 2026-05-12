@@ -30,7 +30,7 @@ pub static TLS_EVENTS: PerfEventArray<TlsEvent> = PerfEventArray::new(0);
 
 /// Key for all flow state lookups
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FlowKey {
     pub src_ip: u32,
     pub dst_ip: u32,
@@ -150,6 +150,11 @@ pub const EMPTY_FLOW_STATE: FlowState = FlowState {
 /// Scratch: `pid_tgid` → `struct sock *` (as `u64`) between `tcp_recvmsg` kprobe and kretprobe.
 #[map]
 pub static RECVMSG_SOCK: HashMap<u64, u64> = HashMap::with_max_entries(4096, 0);
+
+/// Last outbound `FlowKey` for this thread (from `tcp_connect`), used by TLS uprobes to merge
+/// SNI / HTTP into the correct row without scanning `FLOW_TABLE`.
+#[map]
+pub static TLS_THREAD_FLOW: HashMap<u64, FlowKey> = HashMap::with_max_entries(8192, 0);
 
 /// LRU hash — kernel evicts oldest entries automatically under memory pressure
 /// Key: FlowKey (5-tuple), Value: FlowState

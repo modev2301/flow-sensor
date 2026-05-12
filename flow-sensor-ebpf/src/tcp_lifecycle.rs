@@ -52,6 +52,11 @@ unsafe fn init_flow_row(key: &FlowKey, direction: u8) -> Result<(), i64> {
         return Err(-1);
     };
     fill_new_flow_state(&mut *st, direction);
+    // TLS uprobes key only the outbound leg (proxy → upstream); inbound accept stays unmapped.
+    if direction == FlowDirection::Outbound as u8 {
+        let pid_tgid = bpf_get_current_pid_tgid();
+        let _ = TLS_THREAD_FLOW.insert(&pid_tgid, key, 0);
+    }
     Ok(())
 }
 
