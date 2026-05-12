@@ -16,6 +16,8 @@ use aya_ebpf::{
 };
 use flow_sensor_common::*;
 
+/// Max plaintext bytes copied from userspace per SSL hook (stack-sized buffer).
+const TLS_SCRATCH_LEN: usize = 256;
 
 /// Scratch space: pid_tgid → SSL write buffer pointer
 /// We save the pointer on entry, read the data on return
@@ -77,9 +79,9 @@ unsafe fn handle_ssl_write_return(ctx: &RetProbeContext) -> Result<u32, i64> {
     };
     SSL_ARGS.remove(&pid_tgid)?;
 
-    // Read up to 512 bytes of the plaintext — enough for HTTP headers
-    let read_len = (args.len as usize).min(512);
-    let mut buf = [0u8; 512];
+    // Read plaintext for HTTP header sniffing (bounded stack).
+    let read_len = (args.len as usize).min(TLS_SCRATCH_LEN);
+    let mut buf = [0u8; TLS_SCRATCH_LEN];
     bpf_probe_read_user_buf(args.buf_ptr as *const u8, &mut buf[..read_len]).map_err(|e| e as i64)?;
 
     // Parse HTTP headers from plaintext buffer
@@ -137,8 +139,8 @@ unsafe fn handle_ssl_read_return(ctx: &RetProbeContext) -> Result<u32, i64> {
     };
     SSL_ARGS.remove(&pid_tgid)?;
 
-    let read_len = (ret as usize).min(512);
-    let mut buf = [0u8; 512];
+    let read_len = (ret as usize).min(TLS_SCRATCH_LEN);
+    let mut buf = [0u8; TLS_SCRATCH_LEN];
     bpf_probe_read_user_buf(args.buf_ptr as *const u8, &mut buf[..read_len]).map_err(|e| e as i64)?;
 
     // Parse HTTP response status from plaintext

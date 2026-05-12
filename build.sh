@@ -13,6 +13,10 @@ echo "→ Checking Rust nightly..."
 rustup toolchain install nightly --component rust-src 2>/dev/null || true
 rustup target add --toolchain nightly bpfel-unknown-none 2>/dev/null || true
 
+# bpf-linker loads rustc's libLLVM; some installs need the toolchain lib dir on LD_LIBRARY_PATH.
+RUST_SYSROOT="$(rustc +nightly --print sysroot)"
+export LD_LIBRARY_PATH="${RUST_SYSROOT}/lib:${LD_LIBRARY_PATH:-}"
+
 # Install bpf-linker if not present
 if ! command -v bpf-linker >/dev/null 2>&1; then
     echo "→ Installing bpf-linker..."
@@ -21,9 +25,9 @@ fi
 
 echo ""
 echo "→ Building eBPF programs (kernel space)..."
-# bpf-linker loads the same libLLVM as nightly rustc; some distros need this on PATH.
-export LD_LIBRARY_PATH="$(rustc +nightly --print sysroot)/lib:${LD_LIBRARY_PATH:-}"
-cargo +nightly build \
+# RUSTFLAGS only for this crate: do not pass BPF llvm-args to the host userspace build below.
+env RUSTFLAGS="${RUSTFLAGS:-} -Cllvm-args=-bpf-stack-size=524288" \
+    cargo +nightly build \
     --manifest-path flow-sensor-ebpf/Cargo.toml \
     --target bpfel-unknown-none \
     -Z build-std=core \

@@ -102,6 +102,51 @@ pub struct FlowState {
     pub congestion_state_final: u8,
 }
 
+/// All-zero template inserted into `FLOW_TABLE`, then updated in-place.
+/// Avoids placing a full `FlowState` on the BPF stack in connect/accept paths.
+pub const EMPTY_FLOW_STATE: FlowState = FlowState {
+    pid: 0,
+    ppid: 0,
+    uid: 0,
+    gid: 0,
+    comm: [0; COMM_LEN],
+    cgroup: [0; CGROUP_LEN],
+    direction: 0,
+    bytes_sent: 0,
+    bytes_recv: 0,
+    pkts_sent: 0,
+    pkts_recv: 0,
+    srtt_us_min: u32::MAX,
+    srtt_us_max: 0,
+    srtt_us_last: 0,
+    rttvar_us_max: 0,
+    cwnd_min: u32::MAX,
+    cwnd_max: 0,
+    ecn_signals: 0,
+    retransmit_count: 0,
+    retransmit_bytes: 0,
+    retransmit_rto_count: 0,
+    retransmit_fast_count: 0,
+    retransmit_tlp_count: 0,
+    sack_blocks_received: 0,
+    tls_sni: [0; HOST_LEN],
+    http_host: [0; HOST_LEN],
+    http_method: [0; 8],
+    http_path: [0; PATH_LEN],
+    http_status: 0,
+    has_tls: 0,
+    has_http: 0,
+    ssl_write_ts_ns: 0,
+    connect_ts_ns: 0,
+    first_byte_ts_ns: 0,
+    first_recv_ts_ns: 0,
+    tls_ready_ts_ns: 0,
+    chain_id: 0,
+    parent_chain_id: 0,
+    chain_depth: 0,
+    congestion_state_final: 0,
+};
+
 /// LRU hash — kernel evicts oldest entries automatically under memory pressure
 /// Key: FlowKey (5-tuple), Value: FlowState
 #[map]

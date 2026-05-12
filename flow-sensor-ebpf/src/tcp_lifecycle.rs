@@ -42,65 +42,70 @@ unsafe fn flow_key_from_sock(sk: *const core::ffi::c_void) -> Option<FlowKey> {
     })
 }
 
-/// Initialize a fresh FlowState for a new connection
-unsafe fn init_flow_state(direction: u8) -> FlowState {
+/// Insert an empty row then fill identity in-place (keeps large `FlowState` off the stack).
+unsafe fn init_flow_row(key: &FlowKey, direction: u8) -> Result<(), i64> {
+    FLOW_TABLE.insert(key, &EMPTY_FLOW_STATE, 0)?;
+    let Some(st) = FLOW_TABLE.get_ptr_mut(key) else {
+        return Err(-1);
+    };
+    fill_new_flow_state(&mut *st, direction);
+    Ok(())
+}
+
+unsafe fn fill_new_flow_state(st: &mut FlowState, direction: u8) {
     let pid_tgid = bpf_get_current_pid_tgid();
     let uid_gid = bpf_get_current_uid_gid();
     let now = bpf_ktime_get_ns();
 
     let comm = bpf_get_current_comm().unwrap_or([0u8; COMM_LEN]);
 
-    // Pull causal chain context for this thread
     let (chain_id, parent_chain_id, chain_depth) =
         if let Some(ctx) = CAUSAL_MAP.get(&pid_tgid) {
             (ctx.chain_id, ctx.parent_chain_id, ctx.depth)
         } else {
-            // New chain — use timestamp as unique ID
             (now, 0, 0)
         };
 
-    FlowState {
-        pid: (pid_tgid >> 32) as u32,
-        ppid: 0, // filled by userspace from /proc
-        uid: uid_gid as u32,
-        gid: (uid_gid >> 32) as u32,
-        comm,
-        cgroup: [0u8; CGROUP_LEN], // filled from bpf_get_current_cgroup_id
-        direction,
-        bytes_sent: 0,
-        bytes_recv: 0,
-        pkts_sent: 0,
-        pkts_recv: 0,
-        srtt_us_min: u32::MAX,
-        srtt_us_max: 0,
-        srtt_us_last: 0,
-        rttvar_us_max: 0,
-        cwnd_min: u32::MAX,
-        cwnd_max: 0,
-        ecn_signals: 0,
-        retransmit_count: 0,
-        retransmit_bytes: 0,
-        retransmit_rto_count: 0,
-        retransmit_fast_count: 0,
-        retransmit_tlp_count: 0,
-        sack_blocks_received: 0,
-        tls_sni: [0u8; HOST_LEN],
-        http_host: [0u8; HOST_LEN],
-        http_method: [0u8; 8],
-        http_path: [0u8; PATH_LEN],
-        http_status: 0,
-        has_tls: 0,
-        has_http: 0,
-        ssl_write_ts_ns: 0,
-        connect_ts_ns: now,
-        first_byte_ts_ns: 0,
-        first_recv_ts_ns: 0,
-        tls_ready_ts_ns: 0,
-        chain_id,
-        parent_chain_id,
-        chain_depth,
-        congestion_state_final: 0,
-    }
+    st.pid = (pid_tgid >> 32) as u32;
+    st.ppid = 0;
+    st.uid = uid_gid as u32;
+    st.gid = (uid_gid >> 32) as u32;
+    st.comm = comm;
+    st.cgroup = [0u8; CGROUP_LEN];
+    st.direction = direction;
+    st.bytes_sent = 0;
+    st.bytes_recv = 0;
+    st.pkts_sent = 0;
+    st.pkts_recv = 0;
+    st.srtt_us_min = u32::MAX;
+    st.srtt_us_max = 0;
+    st.srtt_us_last = 0;
+    st.rttvar_us_max = 0;
+    st.cwnd_min = u32::MAX;
+    st.cwnd_max = 0;
+    st.ecn_signals = 0;
+    st.retransmit_count = 0;
+    st.retransmit_bytes = 0;
+    st.retransmit_rto_count = 0;
+    st.retransmit_fast_count = 0;
+    st.retransmit_tlp_count = 0;
+    st.sack_blocks_received = 0;
+    st.tls_sni = [0u8; HOST_LEN];
+    st.http_host = [0u8; HOST_LEN];
+    st.http_method = [0u8; 8];
+    st.http_path = [0u8; PATH_LEN];
+    st.http_status = 0;
+    st.has_tls = 0;
+    st.has_http = 0;
+    st.ssl_write_ts_ns = 0;
+    st.connect_ts_ns = now;
+    st.first_byte_ts_ns = 0;
+    st.first_recv_ts_ns = 0;
+    st.tls_ready_ts_ns = 0;
+    st.chain_id = chain_id;
+    st.parent_chain_id = parent_chain_id;
+    st.chain_depth = chain_depth;
+    st.congestion_state_final = 0;
 }
 
 // ── TCP connect (outbound) ───────────────────────────────────────────────────
@@ -117,8 +122,7 @@ pub fn tcp_connect(ctx: ProbeContext) -> u32 {
 unsafe fn handle_tcp_connect(ctx: &ProbeContext) -> Result<u32, i64> {
     let sk = ctx.arg::<*const core::ffi::c_void>(0).ok_or(-1)?;
     let key = flow_key_from_sock(sk).ok_or(-1)?;
-    let state = init_flow_state(FlowDirection::Outbound as u8);
-    FLOW_TABLE.insert(&key, &state, 0)?;
+    init_flow_row(&key, FlowDirection::Outbound as u8)?;
     Ok(0)
 }
 
@@ -137,8 +141,7 @@ unsafe fn handle_accept(ctx: &RetProbeContext) -> Result<u32, i64> {
     let sk = ctx.ret::<*const core::ffi::c_void>().ok_or(-1)?;
     if sk.is_null() { return Ok(0); }
     let key = flow_key_from_sock(sk).ok_or(-1)?;
-    let state = init_flow_state(FlowDirection::Inbound as u8);
-    FLOW_TABLE.insert(&key, &state, 0)?;
+    init_flow_row(&key, FlowDirection::Inbound as u8)?;
     Ok(0)
 }
 
@@ -158,78 +161,79 @@ unsafe fn handle_tcp_close(ctx: &ProbeContext) -> Result<u32, i64> {
     let sk = ctx.arg::<*const core::ffi::c_void>(0).ok_or(-1)?;
     let key = flow_key_from_sock(sk).ok_or(-1)?;
 
-    let state = match FLOW_TABLE.get(&key) {
-        Some(s) => *s,
-        None => return Ok(0), // connection we didn't track (pre-sensor)
+    // Borrow from the map so we never copy a full `FlowState` onto the stack.
+    let event = {
+        let Some(state) = FLOW_TABLE.get(&key) else {
+            return Ok(0);
+        };
+        let now = bpf_ktime_get_ns();
+        let duration_ns = now.saturating_sub(state.connect_ts_ns);
+        FlowEvent {
+            pid: state.pid,
+            ppid: state.ppid,
+            uid: state.uid,
+            gid: state.gid,
+            comm: state.comm,
+            cgroup: state.cgroup,
+            src_ip: key.src_ip,
+            dst_ip: key.dst_ip,
+            src_port: key.src_port,
+            dst_port: key.dst_port,
+            protocol: key.protocol,
+            direction: state.direction,
+            bytes_sent: state.bytes_sent,
+            bytes_recv: state.bytes_recv,
+            pkts_sent: state.pkts_sent,
+            pkts_recv: state.pkts_recv,
+            srtt_us_min: if state.srtt_us_min == u32::MAX { 0 } else { state.srtt_us_min },
+            srtt_us_max: state.srtt_us_max,
+            srtt_us_final: state.srtt_us_last,
+            rttvar_us_max: state.rttvar_us_max,
+            retransmit_count: state.retransmit_count,
+            retransmit_bytes: state.retransmit_bytes,
+            retransmit_rto_count: state.retransmit_rto_count,
+            retransmit_fast_count: state.retransmit_fast_count,
+            retransmit_tlp_count: state.retransmit_tlp_count,
+            sack_blocks_received: state.sack_blocks_received,
+            cwnd_min: if state.cwnd_min == u32::MAX { 0 } else { state.cwnd_min },
+            cwnd_max: state.cwnd_max,
+            ecn_signals: state.ecn_signals,
+            tls_sni: state.tls_sni,
+            http_host: state.http_host,
+            http_method: state.http_method,
+            http_path: state.http_path,
+            http_status: state.http_status,
+            has_tls: state.has_tls,
+            has_http: state.has_http,
+            connect_ts_ns: state.connect_ts_ns,
+            first_byte_ts_ns: state.first_byte_ts_ns,
+            first_recv_ts_ns: state.first_recv_ts_ns,
+            close_ts_ns: now,
+            duration_ns,
+            time_to_first_byte_ns: state.first_byte_ts_ns.saturating_sub(state.connect_ts_ns),
+            tls_handshake_ns: if state.tls_ready_ts_ns > 0 {
+                state.tls_ready_ts_ns.saturating_sub(state.connect_ts_ns)
+            } else {
+                0
+            },
+            app_response_time_ns: if state.first_recv_ts_ns > 0 && state.ssl_write_ts_ns > 0 {
+                state.first_recv_ts_ns.saturating_sub(state.ssl_write_ts_ns)
+            } else {
+                0
+            },
+            close_reason: CloseReason::LocalClose as u8,
+            congestion_state_final: state.congestion_state_final,
+            chain_id: state.chain_id,
+            parent_chain_id: state.parent_chain_id,
+            chain_depth: state.chain_depth,
+        }
     };
 
-    let now = bpf_ktime_get_ns();
-    let duration_ns = now.saturating_sub(state.connect_ts_ns);
-
-    // Build the complete FlowEvent
-    let event = FlowEvent {
-        pid: state.pid,
-        ppid: state.ppid,
-        uid: state.uid,
-        gid: state.gid,
-        comm: state.comm,
-        cgroup: state.cgroup,
-        src_ip: key.src_ip,
-        dst_ip: key.dst_ip,
-        src_port: key.src_port,
-        dst_port: key.dst_port,
-        protocol: key.protocol,
-        direction: state.direction,
-        bytes_sent: state.bytes_sent,
-        bytes_recv: state.bytes_recv,
-        pkts_sent: state.pkts_sent,
-        pkts_recv: state.pkts_recv,
-        srtt_us_min: if state.srtt_us_min == u32::MAX { 0 } else { state.srtt_us_min },
-        srtt_us_max: state.srtt_us_max,
-        srtt_us_final: state.srtt_us_last,
-        rttvar_us_max: state.rttvar_us_max,
-        retransmit_count: state.retransmit_count,
-        retransmit_bytes: state.retransmit_bytes,
-        retransmit_rto_count: state.retransmit_rto_count,
-        retransmit_fast_count: state.retransmit_fast_count,
-        retransmit_tlp_count: state.retransmit_tlp_count,
-        sack_blocks_received: state.sack_blocks_received,
-        cwnd_min: if state.cwnd_min == u32::MAX { 0 } else { state.cwnd_min },
-        cwnd_max: state.cwnd_max,
-        ecn_signals: state.ecn_signals,
-        tls_sni: state.tls_sni,
-        http_host: state.http_host,
-        http_method: state.http_method,
-        http_path: state.http_path,
-        http_status: state.http_status,
-        has_tls: state.has_tls,
-        has_http: state.has_http,
-        connect_ts_ns: state.connect_ts_ns,
-        first_byte_ts_ns: state.first_byte_ts_ns,
-        first_recv_ts_ns: state.first_recv_ts_ns,
-        close_ts_ns: now,
-        duration_ns,
-        time_to_first_byte_ns: state.first_byte_ts_ns.saturating_sub(state.connect_ts_ns),
-        tls_handshake_ns: if state.tls_ready_ts_ns > 0 {
-            state.tls_ready_ts_ns.saturating_sub(state.connect_ts_ns)
-        } else { 0 },
-        app_response_time_ns: if state.first_recv_ts_ns > 0 && state.ssl_write_ts_ns > 0 {
-            state.first_recv_ts_ns.saturating_sub(state.ssl_write_ts_ns)
-        } else { 0 },
-        close_reason: CloseReason::LocalClose as u8,
-        congestion_state_final: state.congestion_state_final,
-        chain_id: state.chain_id,
-        parent_chain_id: state.parent_chain_id,
-        chain_depth: state.chain_depth,
-    };
-
-    // Write to ring buffer — zero-copy path to userspace
     if let Some(mut buf) = FLOW_EVENTS.reserve::<FlowEvent>(0) {
         buf.write(event);
         buf.submit(0);
     }
 
-    // Clean up flow state
     FLOW_TABLE.remove(&key)?;
     Ok(0)
 }
