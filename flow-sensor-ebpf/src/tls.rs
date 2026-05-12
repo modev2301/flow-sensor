@@ -5,12 +5,14 @@
 //! Outbound `FlowKey` is taken from `TLS_THREAD_FLOW` (set in `tcp_connect` on the same thread).
 //! Parses TLS ClientHello SNI plus minimal HTTP from cleartext application data.
 
+use core::ffi::c_void;
+
 use aya_ebpf::{
     helpers::{
         bpf_get_current_pid_tgid, bpf_ktime_get_ns,
         bpf_probe_read_user_buf,
     },
-    macros::{map, uprobe, uretprobe},
+    macros::{map, uprobe},
     maps::HashMap,
     programs::{ProbeContext, RetProbeContext},
 };
@@ -65,9 +67,13 @@ unsafe fn handle_ssl_write_entry(ctx: &ProbeContext) -> Result<u32, i64> {
     Ok(0)
 }
 
-#[uretprobe]
-pub fn ssl_write_return(ctx: RetProbeContext) -> u32 {
-    match unsafe { handle_ssl_write_return(&ctx) } {
+/// `SSL_write` return — manual section (avoid `#[uretprobe]` macro: nested same-name `fn` + trailing
+/// `return 0` has produced invalid BPF / verifier "last insn is not an exit", 0 insns).
+#[no_mangle]
+#[link_section = "uretprobe"]
+pub unsafe fn ssl_write_return(ctx: *mut c_void) -> u32 {
+    let ctx = RetProbeContext::new(ctx);
+    match handle_ssl_write_return(&ctx) {
         Ok(ret) => ret,
         Err(_) => 0,
     }
@@ -159,9 +165,11 @@ unsafe fn handle_ssl_read_entry(ctx: &ProbeContext) -> Result<u32, i64> {
     Ok(0)
 }
 
-#[uretprobe]
-pub fn ssl_read_return(ctx: RetProbeContext) -> u32 {
-    match unsafe { handle_ssl_read_return(&ctx) } {
+#[no_mangle]
+#[link_section = "uretprobe"]
+pub unsafe fn ssl_read_return(ctx: *mut c_void) -> u32 {
+    let ctx = RetProbeContext::new(ctx);
+    match handle_ssl_read_return(&ctx) {
         Ok(ret) => ret,
         Err(_) => 0,
     }
