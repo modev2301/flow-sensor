@@ -250,7 +250,7 @@ unsafe fn handle_tcp_close(ctx: &ProbeContext) -> Result<u32, i64> {
     entry.submit(0);
 
     FLOW_TABLE.remove(&key)?;
-    Ok(())
+    Ok(0)
 }
 
 // ── TCP RST handling ─────────────────────────────────────────────────────────
