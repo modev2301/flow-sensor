@@ -49,9 +49,11 @@ static SSL_READ_ARGS: HashMap<u64, SslArgs> = HashMap::with_max_entries(4096, 0)
 // Linux's BPF verifier runs `check_subprogs()` before simulating instructions. If LLVM emits
 // BPF-to-BPF calls, each subprogram's last insn must be EXIT or unconditional JA; otherwise the
 // kernel prints `last insn is not an exit or jmp` and then `processed 0 insns` (stats only).
-// `macro_rules!` keeps logic in one Rust `fn` per probe. Avoid **iterators and closures** in hot
-// paths: LLVM's BPF backend may outline those into BPF-to-BPF subprograms; Linux 5.15's
-// `check_subprogs()` rejects subprograms whose last insn is not `exit` or unconditional `ja`.
+// `macro_rules!` keeps logic in one Rust `fn` per probe. Avoid iterators/closures **and** `while`
+// loops: LLVM's BPF backend can outline `while` bodies into separate `.text` subprograms; Linux
+// 5.15 `check_subprogs()` then rejects a subprogram whose last insn is not `exit` or unconditional
+// `ja`. Use **const-bound `for`** (`for i in 0..N` with fixed `N`) so the trip count is known at
+// compile time and codegen stays in one BPF program.
 
 macro_rules! parse_tls_clienthello_sni {
     ($buf:expr, $sni_out:expr) => {{
@@ -116,14 +118,14 @@ macro_rules! parse_tls_clienthello_sni {
                                                         if ext_end > buf.len() {
                                                             0u8
                                                         } else {
-                                                            let mut n = 0u32;
                                                             let mut found = 0u8;
                                                             let mut p2 = p;
-                                                            while p2 + 4 <= ext_end
-                                                                && p2 + 4 <= buf.len()
-                                                                && n < 48
-                                                            {
-                                                                n += 1;
+                                                            for _ext_i in 0..48usize {
+                                                                if p2 + 4 > ext_end
+                                                                    || p2 + 4 > buf.len()
+                                                                {
+                                                                    break;
+                                                                }
                                                                 let etype = ((buf[p2] as u16) << 8)
                                                                     | (buf[p2 + 1] as u16);
                                                                 let elen = ((buf[p2 + 2] as usize)
@@ -221,13 +223,14 @@ macro_rules! parse_http_request {
             if is_http {
                 *has_http = 1;
                 let mut first_space: usize = buf.len();
-                let mut si = 0usize;
-                while si < buf.len() {
+                for si in 0..TLS_SCRATCH_LEN {
+                    if si >= buf.len() {
+                        break;
+                    }
                     if buf[si] == b' ' {
                         first_space = si;
                         break;
                     }
-                    si += 1;
                 }
                 let method_end = if first_space == buf.len() {
                     7usize
@@ -241,21 +244,25 @@ macro_rules! parse_http_request {
                     if path_start < buf.len() {
                         let mut path_end =
                             core::cmp::min(path_start.saturating_add(PATH_LEN), buf.len());
-                        let mut pj = path_start;
-                        while pj < buf.len() && pj < path_start + PATH_LEN {
+                        for off in 0..PATH_LEN {
+                            let pj = path_start + off;
+                            if pj >= buf.len() || pj >= path_start + PATH_LEN {
+                                break;
+                            }
                             if buf[pj] == b' ' {
                                 path_end = pj;
                                 break;
                             }
-                            pj += 1;
                         }
                         let copy_len = (path_end - path_start).min(PATH_LEN);
                         path_out[..copy_len]
                             .copy_from_slice(&buf[path_start..path_start + copy_len]);
                     }
                 }
-                let mut hi = 0usize;
-                while hi < buf.len().saturating_sub(6) && hi < 400 {
+                for hi in 0..400usize {
+                    if hi + 6 > buf.len() {
+                        break;
+                    }
                     let h0 = buf[hi];
                     let h1 = buf[hi + 1];
                     let h2 = buf[hi + 2];
@@ -273,14 +280,16 @@ macro_rules! parse_http_request {
                         if val_start < buf.len() {
                             let mut val_end =
                                 core::cmp::min(val_start.saturating_add(HOST_LEN), buf.len());
-                            let mut vj = val_start;
-                            while vj < buf.len() && vj < val_start + HOST_LEN {
+                            for off in 0..HOST_LEN {
+                                let vj = val_start + off;
+                                if vj >= buf.len() || vj >= val_start + HOST_LEN {
+                                    break;
+                                }
                                 let c = buf[vj];
                                 if c == b'\r' || c == b'\n' {
                                     val_end = vj;
                                     break;
                                 }
-                                vj += 1;
                             }
                             let copy_len = (val_end - val_start).min(HOST_LEN);
                             host_out[..copy_len]
@@ -288,7 +297,6 @@ macro_rules! parse_http_request {
                         }
                         break;
                     }
-                    hi += 1;
                 }
             }
         }
@@ -304,13 +312,14 @@ macro_rules! parse_http_status {
             0u16
         } else {
             let mut status_start = 0usize;
-            let mut si = 5usize;
-            while si < buf.len() {
+            for si in 5..TLS_SCRATCH_LEN {
+                if si >= buf.len() {
+                    break;
+                }
                 if buf[si] == b' ' {
                     status_start = si + 1;
                     break;
                 }
-                si += 1;
             }
             if status_start == 0 || status_start + 3 > buf.len() {
                 0u16
