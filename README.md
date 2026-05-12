@@ -33,6 +33,7 @@ single structured event per connection.
 - Linux kernel 5.8+ (for BPF ring buffer support)
 - `CAP_BPF` + `CAP_NET_ADMIN` (or run as root)
 - Rust toolchain (stable + nightly for BPF target)
+- **Linux** for live BPF (`aya` is only linked on Linux; macOS builds run **stub mode** with a synthetic event)
 - `clang` + `llvm` for BPF compilation
 - `bpf-linker` **0.10+ with LLVM 22** (not the Ubuntu `bpf-linker` package — it is often LLVM 14 and triggers “opaque pointers / Reader: LLVM 14” with current nightly)
 

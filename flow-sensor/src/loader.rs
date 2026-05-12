@@ -1,132 +1,161 @@
 //! BPF loader — loads and attaches all eBPF programs, runs the event loop.
 //!
-//! Build with aya on Rust 1.79+:
-//!   Add to Cargo.toml: aya = { version = "0.13", features = ["async_tokio"] }
-//!   Add to Cargo.toml: aya-log = { version = "0.2" }
-//!
-//! Without aya (stub mode): runs a synthetic event so the output pipeline
-//! can be verified without kernel privileges.
+//! On **Linux**, `aya` loads `flow-sensor-ebpf` and reads `FLOW_EVENTS` from a ring buffer.
+//! On other targets, stub mode emits one synthetic event (for CI / macOS dev).
 
 use flow_sensor_common::FlowEvent;
 use tokio::signal;
-use std::io::Write;
 use tracing::{info, warn};
 
 use crate::{enricher, printer, EventFilter};
 
+// ── Linux: live BPF ───────────────────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+mod live {
+    use super::*;
+    use anyhow::Context;
+    use aya::maps::RingBuf;
+    use std::convert::TryInto;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    pub struct BpfHandle {
+        pub bpf: aya::Ebpf,
+        ring: RingBuf<aya::maps::MapData>,
+    }
+
+    fn ebpf_object_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../flow-sensor-ebpf/target/bpfel-unknown-none/release/libflow_sensor_ebpf.so",
+        )
+    }
+
+    fn attach_kprobe(bpf: &mut aya::Ebpf, prog: &str, kernel_fn: &str) -> anyhow::Result<()> {
+        let program = bpf
+            .program_mut(prog)
+            .ok_or_else(|| anyhow::anyhow!("program `{prog}` not found in BPF object"))?;
+        let p: &mut aya::programs::KProbe = program.try_into().with_context(|| {
+            format!("program `{prog}` is not a kprobe/kretprobe (wrong type or missing)")
+        })?;
+        p.load()
+            .with_context(|| format!("failed to load BPF program `{prog}`"))?;
+        let _link = p
+            .attach(kernel_fn, 0)
+            .with_context(|| format!("failed to attach `{prog}` to kernel `{kernel_fn}`"))?;
+        Ok(())
+    }
+
+    pub async fn load_and_attach(_interface: &str) -> anyhow::Result<BpfHandle> {
+        info!("Loading eBPF (aya) — live mode");
+        let path = ebpf_object_path();
+        let data = std::fs::read(&path).with_context(|| {
+            format!(
+                "read BPF object {} — build the eBPF crate first (see README / ./build.sh)",
+                path.display()
+            )
+        })?;
+
+        let mut bpf = aya::Ebpf::load(&data).context("Ebpf::load failed")?;
+
+        // (program section name, kernel function symbol)
+        const ATTACH: &[(&str, &str)] = &[
+            ("tcp_connect", "tcp_connect"),
+            ("inet_csk_accept", "inet_csk_accept"),
+            ("tcp_close", "tcp_close"),
+            ("tcp_send_active_reset", "tcp_send_active_reset"),
+            ("tcp_sendmsg", "tcp_sendmsg"),
+            ("tcp_recvmsg", "tcp_recvmsg"),
+            ("tcp_rcv_established", "tcp_rcv_established"),
+            ("tcp_enter_cwr", "tcp_enter_cwr"),
+            ("tcp_enter_loss", "tcp_enter_loss"),
+            ("tcp_enter_recovery", "tcp_enter_recovery"),
+            ("tcp_retransmit_skb", "tcp_retransmit_skb"),
+            ("tcp_send_loss_probe", "tcp_send_loss_probe"),
+            ("tcp_fast_retransmit", "tcp_retransmit_timer"),
+            ("tcp_sacktag", "tcp_sacktag_write_queue"),
+            ("on_new_task", "wake_up_new_task"),
+            ("on_exit", "do_exit"),
+        ];
+
+        for (prog, kfn) in ATTACH {
+            attach_kprobe(&mut bpf, prog, kfn)
+                .with_context(|| format!("kprobe attach `{prog}` -> `{kfn}`"))?;
+        }
+
+        let map = bpf
+            .take_map("FLOW_EVENTS")
+            .context("map FLOW_EVENTS missing from BPF object")?;
+        let ring =
+            RingBuf::try_from(map).context("FLOW_EVENTS is not a BPF_MAP_TYPE_RINGBUF")?;
+
+        Ok(BpfHandle { bpf, ring })
+    }
+
+    pub async fn event_loop(
+        mut handle: BpfHandle,
+        output_format: &str,
+        filter: EventFilter,
+    ) -> anyhow::Result<()> {
+        info!("Event loop: FLOW_EVENTS ring buffer (live BPF)");
+        let ring = &mut handle.ring;
+        let mut count = 0u64;
+        loop {
+            tokio::select! {
+                _ = signal::ctrl_c() => {
+                    info!("Total flows received: {}", count);
+                    break;
+                }
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(50)) => {
+                    while let Some(item) = ring.next() {
+                        if item.len() < std::mem::size_of::<FlowEvent>() {
+                            continue;
+                        }
+                        let event = unsafe {
+                            (item.as_ptr() as *const FlowEvent).read_unaligned()
+                        };
+                        count += 1;
+                        if !filter.matches(&event) {
+                            continue;
+                        }
+                        let enriched = enricher::enrich(&event);
+                        match output_format {
+                            "json" | "jsonl" => printer::print_json(&enriched),
+                            _ => printer::print_pretty(&enriched),
+                        }
+                        let _ = std::io::stdout().flush();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use live::{event_loop, load_and_attach, BpfHandle};
+
+// ── Non-Linux: stub ───────────────────────────────────────────────────────────
+
+#[cfg(not(target_os = "linux"))]
 pub struct BpfHandle {
-    // In real impl: pub bpf: aya::Bpf
     _private: (),
 }
 
-/// Load and attach all eBPF programs to the kernel.
-/// Requires CAP_BPF + CAP_NET_ADMIN (root).
+#[cfg(not(target_os = "linux"))]
 pub async fn load_and_attach(interface: &str) -> anyhow::Result<BpfHandle> {
     info!("Attaching eBPF programs to interface: {}", interface);
-
-    // ── Real aya implementation (uncomment when aya is in Cargo.toml) ────────
-    //
-    // use aya::{include_bytes_aligned, Bpf};
-    // use aya::programs::{KProbe, KRetProbe};
-    // use aya_log::BpfLogger;
-    //
-    // let bpf_bytes = include_bytes_aligned!(
-    //     "../../target/bpfel-unknown-none/release/flow-sensor-ebpf"
-    // );
-    // let mut bpf = Bpf::load(bpf_bytes)?;
-    // if let Err(e) = BpfLogger::init(&mut bpf) {
-    //     tracing::warn!("BPF logger init failed: {}", e);
-    // }
-    //
-    // // TCP lifecycle
-    // attach_kprobe(&mut bpf, "tcp_connect", "tcp_connect")?;
-    // attach_kretprobe(&mut bpf, "inet_csk_accept", "inet_csk_accept")?;
-    // attach_kprobe(&mut bpf, "tcp_close", "tcp_close")?;
-    // attach_kprobe(&mut bpf, "tcp_sendmsg", "tcp_sendmsg")?;
-    // attach_kprobe(&mut bpf, "tcp_send_active_reset", "tcp_send_active_reset")?;
-    //
-    // // TCP quality
-    // attach_kprobe(&mut bpf, "tcp_rcv_established", "tcp_rcv_established")?;
-    // attach_kprobe(&mut bpf, "tcp_enter_cwr", "tcp_enter_cwr")?;
-    // attach_kprobe(&mut bpf, "tcp_enter_loss", "tcp_enter_loss")?;
-    // attach_kprobe(&mut bpf, "tcp_enter_recovery", "tcp_enter_recovery")?;
-    //
-    // // Retransmit reasons
-    // attach_kprobe(&mut bpf, "tcp_retransmit_skb", "tcp_retransmit_skb")?;
-    // attach_kprobe(&mut bpf, "tcp_send_loss_probe", "tcp_send_loss_probe")?;
-    // attach_kprobe(&mut bpf, "tcp_sacktag_write_queue", "tcp_sacktag_write_queue")?;
-    //
-    // // Causal chains
-    // attach_kprobe(&mut bpf, "wake_up_new_task", "wake_up_new_task")?;
-    // attach_kprobe(&mut bpf, "do_exit", "do_exit")?;
-    //
-    // return Ok(BpfHandle { bpf });
-    // ─────────────────────────────────────────────────────────────────────────
-
-    info!("Stub mode — aya not compiled in. Add aya to Cargo.toml for live BPF.");
+    info!("Stub mode — aya is only linked on Linux. Build on Linux for live BPF.");
     Ok(BpfHandle { _private: () })
 }
 
-// /// Attach a kprobe program by name
-// fn attach_kprobe(bpf: &mut aya::Bpf, prog: &str, func: &str) -> anyhow::Result<()> {
-//     use aya::programs::KProbe;
-//     let p: &mut KProbe = bpf.program_mut(prog)
-//         .ok_or_else(|| anyhow::anyhow!("program {} not found", prog))?
-//         .try_into()?;
-//     p.load()?;
-//     p.attach(func, 0)?;
-//     tracing::debug!("kprobe attached: {} -> {}", prog, func);
-//     Ok(())
-// }
-//
-// /// Attach a kretprobe program by name
-// fn attach_kretprobe(bpf: &mut aya::Bpf, prog: &str, func: &str) -> anyhow::Result<()> {
-//     use aya::programs::KRetProbe;
-//     let p: &mut KRetProbe = bpf.program_mut(prog)
-//         .ok_or_else(|| anyhow::anyhow!("program {} not found", prog))?
-//         .try_into()?;
-//     p.load()?;
-//     p.attach(func, 0)?;
-//     tracing::debug!("kretprobe attached: {} -> {}", prog, func);
-//     Ok(())
-// }
-
-/// Main event loop — reads FlowEvents from ring buffer, enriches, outputs.
+#[cfg(not(target_os = "linux"))]
 pub async fn event_loop(
     _handle: BpfHandle,
     output_format: &str,
     filter: EventFilter,
 ) -> anyhow::Result<()> {
-    // ── Real aya ring buffer loop (uncomment with aya) ────────────────────────
-    //
-    // use aya::maps::RingBuf;
-    // let mut ring = {
-    //     let map = _handle.bpf.map_mut("FLOW_EVENTS")
-    //         .ok_or_else(|| anyhow::anyhow!("FLOW_EVENTS map not found"))?;
-    //     RingBuf::try_from(map)?
-    // };
-    // let mut count = 0u64;
-    // loop {
-    //     tokio::select! {
-    //         _ = signal::ctrl_c() => {
-    //             info!("Total flows: {}", count);
-    //             break;
-    //         }
-    //         _ = tokio::time::sleep(tokio::time::Duration::from_millis(1)) => {
-    //             while let Some(item) = ring.next() {
-    //                 let event = unsafe { &*(item.as_ptr() as *const FlowEvent) };
-    //                 count += 1;
-    //                 if !filter.matches(event) { continue; }
-    //                 let enriched = enricher::enrich(event);
-    //                 match output_format {
-    //                     "json" | "jsonl" => printer::print_json(&enriched),
-    //                     _ => printer::print_pretty(&enriched),
-    //                 }
-    //             }
-    //         }
-    //     }
-    // }
-    // ─────────────────────────────────────────────────────────────────────────
+    use std::io::Write;
 
     info!("Event loop: stub mode — emitting synthetic test event");
 
@@ -152,71 +181,67 @@ pub async fn event_loop(
 }
 
 /// Synthetic flow event for verifying the output pipeline without live BPF.
-/// Represents a python3 script hitting api.bigpanda.io through a proxy,
-/// with retransmits and TLS context — exactly the use case we designed for.
+#[cfg(not(target_os = "linux"))]
 fn make_test_event() -> FlowEvent {
     let mut e = unsafe { std::mem::zeroed::<FlowEvent>() };
 
-    e.pid        = std::process::id();
-    e.uid        = libc_getuid();
-    e.src_ip     = u32::from_be_bytes([10, 0, 1, 50]);
-    e.dst_ip     = u32::from_be_bytes([104, 18, 20, 1]);  // Cloudflare (bigpanda CDN)
-    e.src_port   = 54821;
-    e.dst_port   = 443;
-    e.protocol   = 6; // TCP
-    e.direction  = flow_sensor_common::FlowDirection::Outbound as u8;
+    e.pid = std::process::id();
+    e.uid = 0;
+    e.src_ip = u32::from_be_bytes([10, 0, 1, 50]);
+    e.dst_ip = u32::from_be_bytes([104, 18, 20, 1]);
+    e.src_port = 54821;
+    e.dst_port = 443;
+    e.protocol = 6;
+    e.direction = flow_sensor_common::FlowDirection::Outbound as u8;
 
     e.bytes_sent = 1240;
     e.bytes_recv = 48200;
-    e.pkts_sent  = 12;
-    e.pkts_recv  = 38;
+    e.pkts_sent = 12;
+    e.pkts_recv = 38;
 
-    e.srtt_us_min   = 1800;
-    e.srtt_us_max   = 4200;
+    e.srtt_us_min = 1800;
+    e.srtt_us_max = 4200;
     e.srtt_us_final = 2100;
     e.rttvar_us_max = 800;
 
-    e.retransmit_count      = 3;
-    e.retransmit_rto_count  = 1;
+    e.retransmit_count = 3;
+    e.retransmit_rto_count = 1;
     e.retransmit_fast_count = 2;
-    e.retransmit_tlp_count  = 0;
-    e.retransmit_bytes      = 2480;
-    e.sack_blocks_received  = 2;
+    e.retransmit_tlp_count = 0;
+    e.retransmit_bytes = 2480;
+    e.sack_blocks_received = 2;
 
-    e.cwnd_min  = 10;
-    e.cwnd_max  = 32;
+    e.cwnd_min = 10;
+    e.cwnd_max = 32;
     e.ecn_signals = 0;
 
     e.has_tls = 1;
     e.has_http = 1;
 
-    copy_str(&mut e.comm,        b"python3");
-    copy_str(&mut e.tls_sni,     b"api.bigpanda.io");
-    copy_str(&mut e.http_host,   b"api.bigpanda.io");
+    copy_str(&mut e.comm, b"python3");
+    copy_str(&mut e.tls_sni, b"api.bigpanda.io");
+    copy_str(&mut e.http_host, b"api.bigpanda.io");
     copy_str(&mut e.http_method, b"POST");
-    copy_str(&mut e.http_path,   b"/api/v2/alerts");
+    copy_str(&mut e.http_path, b"/api/v2/alerts");
     e.http_status = 200;
 
-    e.connect_ts_ns         = 0;
-    // Long enough to pass typical --min-duration-ms; chain_id=0 passes any --sample-rate N>0.
-    e.duration_ns           = 1_500_000_000;
+    e.connect_ts_ns = 0;
+    e.duration_ns = 1_500_000_000;
     e.time_to_first_byte_ns = 13_200_000;
-    e.tls_handshake_ns      = 12_400_000;
-    e.app_response_time_ns  = 48_200_000;
+    e.tls_handshake_ns = 12_400_000;
+    e.app_response_time_ns = 48_200_000;
 
     e.close_reason = flow_sensor_common::CloseReason::Clean as u8;
 
-    // Must be 0 mod N for default sampling rule (chain_id % sample_rate == 0), or stub vanishes.
-    e.chain_id          = 0;
+    e.chain_id = 0;
     e.parent_chain_id = 0;
-    e.chain_depth     = 0;
+    e.chain_depth = 0;
 
     e
 }
 
+#[cfg(not(target_os = "linux"))]
 fn copy_str(dst: &mut [u8], src: &[u8]) {
     let len = src.len().min(dst.len().saturating_sub(1));
     dst[..len].copy_from_slice(&src[..len]);
 }
-
-fn libc_getuid() -> u32 { 0 }
