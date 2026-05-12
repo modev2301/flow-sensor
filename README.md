@@ -44,7 +44,9 @@ Prefer **`./build.sh`**: it installs a pinned **bpf-linker 0.10.3** with LLVM 22
 chmod +x build.sh && ./build.sh
 ```
 
-If you still see `Reader: LLVM 14.0.0`, remove the distro package (`apt remove bpf-linker`) and run `FLOW_SENSOR_FORCE_BPF_LINKER=1 ./build.sh` to reinstall the project-local linker.
+If you still see `Reader: LLVM 14.0.0` **after** the build uses `flow-sensor-ebpf/.bpf-linker/bin/bpf-linker`, the usual cause is **`LD_LIBRARY_PATH`**: putting `/usr/lib` *before* the rustup sysroot makes the dynamic loader pick the distro’s **libLLVM** (14) instead of nightly’s (22). **`./build.sh` orders paths correctly**; if you invoke `cargo` yourself, put `$(rustc +nightly --print sysroot)/lib` first in `LD_LIBRARY_PATH`, or unset `LD_LIBRARY_PATH` and retry.
+
+If the wrong `bpf-linker` binary was the issue: remove the distro package (`apt remove bpf-linker`) and run `FLOW_SENSOR_FORCE_BPF_LINKER=1 ./build.sh`.
 
 ### Manual steps (without `build.sh`)
 
@@ -65,8 +67,12 @@ cargo +nightly install bpf-linker --version 0.10.3 --force --locked \
 # 4. Install clang/llvm (Ubuntu/Debian)
 apt-get install -y clang llvm libbpf-dev linux-headers-$(uname -r)
 
-# 5. Build eBPF (from repo root; linker path must be this LLVM22 binary)
+# 5. Build eBPF (from repo root; linker path must be this LLVM22 binary).
+# Put rustup's libLLVM first in LD_LIBRARY_PATH — otherwise /usr/lib can shadow it (opaque-pointer / "Reader: LLVM 14").
 export CARGO_TARGET_BPFEL_UNKNOWN_NONE_LINKER="$PWD/flow-sensor-ebpf/.bpf-linker/bin/bpf-linker"
+_sysroot="$(rustc +nightly --print sysroot)"
+_host="$(rustc +nightly -vV | sed -n 's/^host: //p')"
+export LD_LIBRARY_PATH="${_sysroot}/lib:${_sysroot}/lib/rustlib/${_host}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 cargo +nightly build --manifest-path flow-sensor-ebpf/Cargo.toml \
     --target bpfel-unknown-none \
     -Z build-std=core \

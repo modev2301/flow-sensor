@@ -26,15 +26,17 @@ rustup target add --toolchain nightly bpfel-unknown-none 2>/dev/null || true
 # depends on distro libs (zlib, ncurses, …) that live outside the rustup sysroot.
 RUST_SYSROOT="$(rustc +nightly --print sysroot)"
 RUST_HOST="$(rustc +nightly -vV | sed -n 's/^host: //p')"
-export LD_LIBRARY_PATH="${RUST_SYSROOT}/lib:${RUST_SYSROOT}/lib/rustlib/${RUST_HOST}/lib:${LD_LIBRARY_PATH:-}"
-# Typical glibc multiarch paths (Debian/Ubuntu/Fedora-ish); harmless if missing.
+# Sysroot MUST be first: /usr/lib* often ships libLLVM.so (LLVM 14). If that appears
+# before rustup's libLLVM (LLVM 22), bpf-linker loads the wrong LLVM and fails with
+# "Opaque pointers... Reader: LLVM 14.0.0" while reading rustc's LLVM 22 bitcode.
+_base_lp="${RUST_SYSROOT}/lib:${RUST_SYSROOT}/lib/rustlib/${RUST_HOST}/lib:${LD_LIBRARY_PATH:-}"
 _GNU_TRIPLE="$(printf '%s\n' "${RUST_HOST}" | sed 's/-unknown-/-/')"
 for _bpf_lib in /usr/lib64 /lib64 "/usr/lib/${_GNU_TRIPLE}" "/lib/${_GNU_TRIPLE}"; do
     if [ -d "${_bpf_lib}" ]; then
-        LD_LIBRARY_PATH="${_bpf_lib}:${LD_LIBRARY_PATH}"
+        _base_lp="${_base_lp}:${_bpf_lib}"
     fi
 done
-export LD_LIBRARY_PATH
+# Only for bpf-linker / eBPF link: do not export globally (would affect stable userspace link).
 
 # bpf-linker must match rustc nightly LLVM (opaque pointers / bitcode). Pin 0.10.x + LLVM22 features.
 # Reinstall when nightly's LLVM version changes, or when FLOW_SENSOR_FORCE_BPF_LINKER=1.
@@ -52,7 +54,7 @@ fi
 if [ "${_need_bpf_linker}" = true ]; then
     echo "→ Installing bpf-linker 0.10.3 (LLVM22) for rustc LLVM ${RUST_LLVM_VER} → ${BPF_LINKER_PREFIX}"
     mkdir -p "${BPF_LINKER_PREFIX}"
-    cargo +nightly install bpf-linker \
+    env LD_LIBRARY_PATH="${_base_lp}" cargo +nightly install bpf-linker \
         --version 0.10.3 \
         --force \
         --locked \
@@ -73,7 +75,8 @@ echo "   (using BPF linker: ${BPF_LINKER_BIN})"
 export CARGO_TARGET_BPFEL_UNKNOWN_NONE_LINKER="${BPF_LINKER_BIN}"
 export FLOW_SENSOR_BPF_LINKER="${BPF_LINKER_BIN}"
 # RUSTFLAGS only for this crate: do not pass BPF llvm-args to the host userspace build below.
-env RUSTFLAGS="${RUSTFLAGS:-} -Cllvm-args=-bpf-stack-size=1048576 -Clink-arg=--llvm-args=--bpf-stack-size=1048576" \
+env LD_LIBRARY_PATH="${_base_lp}" \
+    RUSTFLAGS="${RUSTFLAGS:-} -Cllvm-args=-bpf-stack-size=1048576 -Clink-arg=--llvm-args=--bpf-stack-size=1048576" \
     cargo +nightly build \
     --manifest-path flow-sensor-ebpf/Cargo.toml \
     --target bpfel-unknown-none \
