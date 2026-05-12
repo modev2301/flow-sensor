@@ -18,13 +18,12 @@ const TLS_EBPF_PROGRAMS: &[&str] = &[
 
 /// Parse the on-disk BPF `.so` with `aya-obj` and log each TLS program's instruction count.
 ///
-/// **Fact:** the kernel verifier line `processed 0 insns` means the program passed to
-/// `BPF_PROG_LOAD` has **zero instructions** in `attr->insn_cnt` (nothing to verify). That is
-/// distinct from a verifier rejection inside a non-empty program.
+/// **Fact:** the kernel verifier line `processed 0 insns` is printed from `print_verification_stats()`
+/// after an *early* failure (often `check_subprogs()` in Linux `kernel/bpf/verifier.c`), before the
+/// main instruction walk — it does **not** mean the ELF had zero instructions.
 ///
-/// If the ELF already has `instructions.len() == 0` for `ssl_write_return`, the failure is
-/// determined **before** the verifier runs meaningful analysis — fix the BPF link / object, not
-/// individual verifier rules.
+/// If `aya_obj` reports `insn_count > 0` but load still fails with `last insn is not an exit or jmp`,
+/// the usual cause is **invalid BPF subprogram boundaries** (LLVM emitted BPF-to-BPF calls).
 #[cfg(target_os = "linux")]
 fn assert_tls_programs_non_empty_elf(so_path: &std::path::Path) -> anyhow::Result<()> {
     use anyhow::Context;
@@ -54,13 +53,10 @@ fn assert_tls_programs_non_empty_elf(so_path: &std::path::Path) -> anyhow::Resul
         if n == 0 {
             anyhow::bail!(
                 "BPF object `{}`: program `{}` has **0 instructions** in the ELF that aya_obj parsed. \
-The kernel then fails BPF_PROG_LOAD with verifier text like `processed 0 insns` and `last insn is not an exit` (EINVAL). \
-This is not a semantic verifier failure inside a real program — the loaded bytecode is empty. \
-Rebuild `flow-sensor-ebpf` (release, target `bpfel-unknown-none`) and confirm this log shows insn_count > 0. \
-You can cross-check with: llvm-objdump --section-headers {}",
+That would produce an empty `BPF_PROG_LOAD` payload. \
+Rebuild `flow-sensor-ebpf` (release, target `bpfel-unknown-none`).",
                 so_path.display(),
                 name,
-                so_path.display(),
             );
         }
     }
