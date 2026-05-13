@@ -64,13 +64,6 @@ unsafe fn read_u8(ptr: *const u8, len: usize, idx: usize) -> Option<u8> {
     }
 }
 
-#[inline(always)]
-unsafe fn write_u8(dst: *mut u8, idx: usize, val: u8) {
-    core::ptr::write_unaligned(dst.add(idx), val);
-}
-
-#[inline(always)]
-
 /// Parse TLS ClientHello SNI from first `len` bytes. Copy into `sni_out` (HOST_LEN).
 /// Returns 1 if found/copied, else 0.
 #[inline(always)]
@@ -198,7 +191,7 @@ unsafe fn parse_tls_clienthello_sni(ptr: *const u8, len: usize, sni_out: *mut u8
                             && name_len <= HOST_LEN
                             && (q + name_len) <= (p2 + elen)
                         {
-                            copy_bytes_bounded(sni_out.as_mut_ptr(), HOST_LEN, ptr, len, len, q, name_len);
+                            copy_bytes_bounded(sni_out, HOST_LEN, ptr, len, q, name_len);
                             return 1;
                         }
                     }
@@ -260,7 +253,7 @@ unsafe fn parse_http_request(
 
     // Copy method (<=7 bytes)
     let method_end = if first_space == len { 7usize } else { core::cmp::min(first_space, 7) };
-    copy_bytes_bounded(method_out.as_mut_ptr(), 8, ptr, len, len, 0, method_end);
+    copy_bytes_bounded(method_out, 8, ptr, len, 0, method_end);
 
     // Copy path
     if first_space < len {
@@ -279,7 +272,7 @@ unsafe fn parse_http_request(
                 }
             }
             let copy_len = path_end.saturating_sub(path_start);
-            copy_bytes_bounded::<PATH_LEN>(path_out, ptr, len, path_start, copy_len);
+            copy_bytes_bounded(path_out, PATH_LEN, ptr, len, path_start, copy_len);
         }
     }
 
@@ -320,7 +313,7 @@ unsafe fn parse_http_request(
                 }
             }
             let copy_len = val_end.saturating_sub(val_start);
-            copy_bytes_bounded(host_out.as_mut_ptr(), HOST_LEN, ptr, len, len, val_start, copy_len);
+            copy_bytes_bounded(host_out, HOST_LEN, ptr, len, val_start, copy_len);
             break;
         }
     }
