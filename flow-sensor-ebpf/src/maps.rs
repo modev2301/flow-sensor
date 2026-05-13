@@ -3,7 +3,7 @@
 
 use aya_ebpf::{
     macros::map,
-    maps::{HashMap, LruHashMap, PerfEventArray, RingBuf},
+    maps::{HashMap, LruHashMap, PerfEventArray, PerCpuArray, RingBuf},
 };
 use flow_sensor_common::*;
 
@@ -155,6 +155,20 @@ pub static RECVMSG_SOCK: HashMap<u64, u64> = HashMap::with_max_entries(4096, 0);
 /// SNI / HTTP into the correct row without scanning `FLOW_TABLE`.
 #[map]
 pub static TLS_THREAD_FLOW: HashMap<u64, FlowKey> = HashMap::with_max_entries(8192, 0);
+
+/// Plaintext scratch for `SSL_write` / `SSL_read` uprobes (`bpf_probe_read_user` target).
+/// Must live in a map: on Linux ≤5.15 the verifier rejects **variable-offset reads from the stack**
+/// (`read_u8` → `ptr.add(idx)`), which TLS parsing needs.
+pub const TLS_SCRATCH_LEN: usize = 256;
+
+#[repr(C)]
+pub struct TlsUprobeScratch {
+    pub data: [u8; TLS_SCRATCH_LEN],
+}
+
+#[map]
+pub static TLS_UPROBE_SCRATCH: PerCpuArray<TlsUprobeScratch> =
+    PerCpuArray::with_max_entries(1, 0);
 
 /// LRU hash — kernel evicts oldest entries automatically under memory pressure
 /// Key: FlowKey (5-tuple), Value: FlowState

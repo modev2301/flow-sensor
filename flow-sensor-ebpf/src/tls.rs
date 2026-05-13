@@ -24,7 +24,7 @@ unsafe fn copy_bytes_bounded(
 
 
 use core::ffi::c_void;
-use core::mem::MaybeUninit;
+use core::ptr::addr_of_mut;
 
 use aya_ebpf::{
     helpers::{bpf_get_current_pid_tgid, bpf_ktime_get_ns, gen},
@@ -34,10 +34,7 @@ use aya_ebpf::{
 };
 
 use flow_sensor_common::*;
-use crate::maps::{FLOW_TABLE, TLS_THREAD_FLOW};
-
-/// Max bytes copied from userspace per SSL hook.
-const TLS_SCRATCH_LEN: usize = 256;
+use crate::maps::{FLOW_TABLE, TLS_THREAD_FLOW, TLS_SCRATCH_LEN, TLS_UPROBE_SCRATCH};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -416,10 +413,10 @@ pub unsafe extern "C" fn ssl_write_return(ctx: *mut c_void) -> u32 {
     };
 
     let read_len = core::cmp::min(args.len as usize, TLS_SCRATCH_LEN);
-    // Uninit scratch: avoids LLVM emitting a 256-byte stack `memset` before `bpf_probe_read_user`
-    // (that memset becomes a bpf-to-bpf blob and confuses older verifiers / return-value checks).
-    let mut buf = MaybeUninit::<[u8; TLS_SCRATCH_LEN]>::uninit();
-    let dst = buf.as_mut_ptr() as *mut u8;
+    let Some(scratch) = TLS_UPROBE_SCRATCH.get_ptr_mut(0) else {
+        return 0;
+    };
+    let dst = addr_of_mut!((*scratch).data) as *mut u8;
     let pr = gen::bpf_probe_read_user(
         dst.cast::<c_void>(),
         read_len as u32,
@@ -520,8 +517,10 @@ pub unsafe extern "C" fn ssl_read_return(ctx: *mut c_void) -> u32 {
     let _ = SSL_READ_ARGS.remove(&pid_tgid);
 
     let read_len = core::cmp::min(ret as usize, TLS_SCRATCH_LEN);
-    let mut buf = MaybeUninit::<[u8; TLS_SCRATCH_LEN]>::uninit();
-    let dst = buf.as_mut_ptr() as *mut u8;
+    let Some(scratch) = TLS_UPROBE_SCRATCH.get_ptr_mut(0) else {
+        return 0;
+    };
+    let dst = addr_of_mut!((*scratch).data) as *mut u8;
     let pr = gen::bpf_probe_read_user(
         dst.cast::<c_void>(),
         read_len as u32,
