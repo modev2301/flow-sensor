@@ -24,6 +24,7 @@ unsafe fn copy_bytes_bounded(
 
 
 use core::ffi::c_void;
+use core::mem::MaybeUninit;
 
 use aya_ebpf::{
     helpers::{bpf_get_current_pid_tgid, bpf_ktime_get_ns, gen},
@@ -415,12 +416,12 @@ pub unsafe extern "C" fn ssl_write_return(ctx: *mut c_void) -> u32 {
     };
 
     let read_len = core::cmp::min(args.len as usize, TLS_SCRATCH_LEN);
-    let mut buf = [0u8; TLS_SCRATCH_LEN];
-    // Call the raw helper instead of `bpf_probe_read_user_buf` + `from_raw_parts_mut`: LLVM can
-    // leave `r0` as the memset destination across the epilogue, and the verifier rejects
-    // `BPF_EXIT` with `r0` pointing at the stack ("cannot return stack pointer to the caller").
+    // Uninit scratch: avoids LLVM emitting a 256-byte stack `memset` before `bpf_probe_read_user`
+    // (that memset becomes a bpf-to-bpf blob and confuses older verifiers / return-value checks).
+    let mut buf = MaybeUninit::<[u8; TLS_SCRATCH_LEN]>::uninit();
+    let dst = buf.as_mut_ptr() as *mut u8;
     let pr = gen::bpf_probe_read_user(
-        buf.as_mut_ptr().cast::<c_void>(),
+        dst.cast::<c_void>(),
         read_len as u32,
         (args.buf_ptr as *const u8).cast::<c_void>(),
     );
@@ -428,7 +429,7 @@ pub unsafe extern "C" fn ssl_write_return(ctx: *mut c_void) -> u32 {
         return 0;
     }
 
-    let ptr = buf.as_ptr();
+    let ptr = dst.cast_const();
 
     // TLS SNI
     let has_sni = parse_tls_clienthello_sni(ptr, read_len, (*st).tls_sni.as_mut_ptr());
@@ -519,9 +520,10 @@ pub unsafe extern "C" fn ssl_read_return(ctx: *mut c_void) -> u32 {
     let _ = SSL_READ_ARGS.remove(&pid_tgid);
 
     let read_len = core::cmp::min(ret as usize, TLS_SCRATCH_LEN);
-    let mut buf = [0u8; TLS_SCRATCH_LEN];
+    let mut buf = MaybeUninit::<[u8; TLS_SCRATCH_LEN]>::uninit();
+    let dst = buf.as_mut_ptr() as *mut u8;
     let pr = gen::bpf_probe_read_user(
-        buf.as_mut_ptr().cast::<c_void>(),
+        dst.cast::<c_void>(),
         read_len as u32,
         (args.buf_ptr as *const u8).cast::<c_void>(),
     );
@@ -534,7 +536,7 @@ pub unsafe extern "C" fn ssl_read_return(ctx: *mut c_void) -> u32 {
         None => return 0,
     };
 
-    let status = parse_http_status(buf.as_ptr(), read_len);
+    let status = parse_http_status(dst.cast_const(), read_len);
     if status == 0 {
         return 0;
     }

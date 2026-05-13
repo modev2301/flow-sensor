@@ -95,15 +95,14 @@ echo "   (using BPF linker: ${BPF_LINKER_BIN})"
 export CARGO_TARGET_BPFEL_UNKNOWN_NONE_LINKER="${BPF_LINKER_BIN}"
 export FLOW_SENSOR_BPF_LINKER="${BPF_LINKER_BIN}"
 
+# Do **not** pass bpf-linker `--unroll-loops` here: it fully unrolls `for 0..TLS_SCRATCH_LEN` etc.,
+# exploding `ssl_write_return` to thousands of insns and a huge memset subprogram (verifier pain).
 env LD_LIBRARY_PATH="${_base_lp}" \
   RUSTFLAGS="${RUSTFLAGS:-} \
     -Zunstable-options \
     -Cpanic=immediate-abort \
     -Cllvm-args=--bpf-stack-size=1048576 \
-    -Cllvm-args=--bpf-expand-memcpy-in-order \
-    -C link-arg=--unroll-loops \
-    -C link-arg=--disable-memory-builtins \
-    -C link-arg=--llvm-args=-bpf-disable-trap-unreachable" \
+    -Cllvm-args=--bpf-expand-memcpy-in-order" \
   cargo +nightly build \
     --manifest-path flow-sensor-ebpf/Cargo.toml \
     --target bpfel-unknown-none \
