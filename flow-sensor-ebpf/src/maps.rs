@@ -3,7 +3,7 @@
 
 use aya_ebpf::{
     macros::map,
-    maps::{HashMap, LruHashMap, PerfEventArray, RingBuf},
+    maps::{HashMap, LruHashMap, PerfEventArray, PerCpuArray, RingBuf},
 };
 use flow_sensor_common::*;
 
@@ -156,10 +156,24 @@ pub static RECVMSG_SOCK: HashMap<u64, u64> = HashMap::with_max_entries(4096, 0);
 #[map]
 pub static TLS_THREAD_FLOW: HashMap<u64, FlowKey> = HashMap::with_max_entries(8192, 0);
 
-/// Max bytes read from the SSL userspace buffer per uretprobe (each byte via `bpf_probe_read_user`).
-/// TLS/HTTP parsers walk plaintext with **variable indices**; copying into a map then using
-/// `ptr.add(idx)` still produces `invalid access to map value` on Linux 5.15 — so we do not bulk-copy.
+/// Bytes copied from the SSL buffer into `TLS_UPROBE_SCRATCH.data` (one `bpf_probe_read_user`).
 pub const TLS_SCRATCH_LEN: usize = 256;
+
+/// Trailing bytes in `TlsUprobeScratch` (not written by the bulk copy). Linux 5.15’s verifier can
+/// still prove a load one past the last byte used in TLS parsing; padding keeps that proof inside
+/// the map `value_size` without per-byte `bpf_probe_read_user` (which blows past the 1M verifier
+/// insn budget).
+const TLS_SCRATCH_PAD: usize = 128;
+
+#[repr(C)]
+pub struct TlsUprobeScratch {
+    pub data: [u8; TLS_SCRATCH_LEN],
+    pub _pad: [u8; TLS_SCRATCH_PAD],
+}
+
+#[map]
+pub static TLS_UPROBE_SCRATCH: PerCpuArray<TlsUprobeScratch> =
+    PerCpuArray::with_max_entries(1, 0);
 
 /// LRU hash — kernel evicts oldest entries automatically under memory pressure
 /// Key: FlowKey (5-tuple), Value: FlowState

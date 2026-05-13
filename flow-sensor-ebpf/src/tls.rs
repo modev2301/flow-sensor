@@ -18,7 +18,7 @@ use aya_ebpf::{
 };
 
 use flow_sensor_common::*;
-use crate::maps::{FLOW_TABLE, TLS_THREAD_FLOW, TLS_SCRATCH_LEN};
+use crate::maps::{FLOW_TABLE, TLS_THREAD_FLOW, TLS_SCRATCH_LEN, TLS_UPROBE_SCRATCH};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -37,28 +37,8 @@ static SSL_WRITE_ARGS: HashMap<u64, SslArgs> = HashMap::with_max_entries(4096, 0
 #[map]
 static SSL_READ_ARGS: HashMap<u64, SslArgs> = HashMap::with_max_entries(4096, 0);
 
-/// Read one byte from **userspace** `src` at `idx`. Uses `bpf_probe_read_user` so the 5.15 verifier
-/// never has to prove variable-offset loads through a map or stack scratch.
 #[inline(always)]
-unsafe fn read_u8_user(src: *const u8, len: usize, idx: usize) -> Option<u8> {
-    if idx >= len {
-        return None;
-    }
-    let mut b = 0u8;
-    let rc = gen::bpf_probe_read_user(
-        addr_of_mut!(b).cast::<c_void>(),
-        1,
-        src.add(idx).cast::<c_void>(),
-    );
-    if rc != 0 {
-        None
-    } else {
-        Some(b)
-    }
-}
-
-#[inline(always)]
-unsafe fn copy_bytes_from_user(
+unsafe fn copy_bytes_bounded(
     out: *mut u8,
     out_len: usize,
     src: *const u8,
@@ -68,11 +48,18 @@ unsafe fn copy_bytes_from_user(
 ) {
     let mut i = 0usize;
     while i < cnt && i < out_len && start + i < src_len {
-        if let Some(v) = read_u8_user(src, src_len, start + i) {
-            *out.add(i) = v;
-        }
+        *out.add(i) = *src.add(start + i);
         i += 1;
     }
+}
+
+/// Read plaintext byte `idx` from the map scratch (`TLS_UPROBE_SCRATCH.data`, filled by one bulk probe read).
+#[inline(always)]
+unsafe fn read_u8(ptr: *const u8, len: usize, idx: usize) -> Option<u8> {
+    if idx >= len || idx >= TLS_SCRATCH_LEN {
+        return None;
+    }
+    Some(core::ptr::read_unaligned(ptr.add(idx)))
 }
 
 /// Parse TLS ClientHello SNI from first `len` bytes. Copy into `sni_out` (HOST_LEN).
@@ -84,10 +71,10 @@ unsafe fn parse_tls_clienthello_sni(ptr: *const u8, len: usize, sni_out: *mut u8
     }
 
     // TLS record header
-    let b0 = read_u8_user(ptr, len, 0).unwrap_or(0);
-    let b1 = read_u8_user(ptr, len, 1).unwrap_or(0);
-    let b3 = read_u8_user(ptr, len, 3).unwrap_or(0);
-    let b4 = read_u8_user(ptr, len, 4).unwrap_or(0);
+    let b0 = read_u8(ptr, len, 0).unwrap_or(0);
+    let b1 = read_u8(ptr, len, 1).unwrap_or(0);
+    let b3 = read_u8(ptr, len, 3).unwrap_or(0);
+    let b4 = read_u8(ptr, len, 4).unwrap_or(0);
 
     if b0 != 0x16 || b1 != 0x03 {
         return 0;
@@ -100,7 +87,7 @@ unsafe fn parse_tls_clienthello_sni(ptr: *const u8, len: usize, sni_out: *mut u8
     }
 
     // handshake type
-    let hs = read_u8_user(ptr, len, 5).unwrap_or(0);
+    let hs = read_u8(ptr, len, 5).unwrap_or(0);
     if hs != 0x01 {
         return 0;
     }
@@ -124,7 +111,7 @@ unsafe fn parse_tls_clienthello_sni(ptr: *const u8, len: usize, sni_out: *mut u8
     if p + 1 > len {
         return 0;
     }
-    let sess_len = read_u8_user(ptr, len, p).unwrap_or(0) as usize;
+    let sess_len = read_u8(ptr, len, p).unwrap_or(0) as usize;
     p += 1;
     if sess_len > 32 {
         return 0;
@@ -138,8 +125,8 @@ unsafe fn parse_tls_clienthello_sni(ptr: *const u8, len: usize, sni_out: *mut u8
     if p + 2 > len {
         return 0;
     }
-    let cs_len = ((read_u8_user(ptr, len, p).unwrap_or(0) as usize) << 8)
-        | (read_u8_user(ptr, len, p + 1).unwrap_or(0) as usize);
+    let cs_len = ((read_u8(ptr, len, p).unwrap_or(0) as usize) << 8)
+        | (read_u8(ptr, len, p + 1).unwrap_or(0) as usize);
     p += 2;
     // Cap list size so the verifier cannot treat `cs_len` as ~64Ki while proving map accesses.
     if cs_len > 512 {
@@ -154,7 +141,7 @@ unsafe fn parse_tls_clienthello_sni(ptr: *const u8, len: usize, sni_out: *mut u8
     if p + 1 > len {
         return 0;
     }
-    let comp_len = read_u8_user(ptr, len, p).unwrap_or(0) as usize;
+    let comp_len = read_u8(ptr, len, p).unwrap_or(0) as usize;
     p += 1;
     if comp_len > 32 {
         return 0;
@@ -168,8 +155,8 @@ unsafe fn parse_tls_clienthello_sni(ptr: *const u8, len: usize, sni_out: *mut u8
     if p + 2 > len {
         return 0;
     }
-    let ext_total = ((read_u8_user(ptr, len, p).unwrap_or(0) as usize) << 8)
-        | (read_u8_user(ptr, len, p + 1).unwrap_or(0) as usize);
+    let ext_total = ((read_u8(ptr, len, p).unwrap_or(0) as usize) << 8)
+        | (read_u8(ptr, len, p + 1).unwrap_or(0) as usize);
     p += 2;
     let ext_end = p.saturating_add(ext_total);
     if ext_end > len {
@@ -183,10 +170,10 @@ unsafe fn parse_tls_clienthello_sni(ptr: *const u8, len: usize, sni_out: *mut u8
             break;
         }
 
-        let etype = ((read_u8_user(ptr, len, p2).unwrap_or(0) as u16) << 8)
-            | (read_u8_user(ptr, len, p2 + 1).unwrap_or(0) as u16);
-        let elen = ((read_u8_user(ptr, len, p2 + 2).unwrap_or(0) as usize) << 8)
-            | (read_u8_user(ptr, len, p2 + 3).unwrap_or(0) as usize);
+        let etype = ((read_u8(ptr, len, p2).unwrap_or(0) as u16) << 8)
+            | (read_u8(ptr, len, p2 + 1).unwrap_or(0) as u16);
+        let elen = ((read_u8(ptr, len, p2 + 2).unwrap_or(0) as usize) << 8)
+            | (read_u8(ptr, len, p2 + 3).unwrap_or(0) as usize);
         p2 += 4;
 
         if elen > 2048 {
@@ -199,23 +186,23 @@ unsafe fn parse_tls_clienthello_sni(ptr: *const u8, len: usize, sni_out: *mut u8
         // server_name extension
         if etype == 0 && elen >= 5 {
             // list_len (2) at p2, then name_type (1), then name_len (2), then name bytes
-            let list_len = ((read_u8_user(ptr, len, p2).unwrap_or(0) as usize) << 8)
-                | (read_u8_user(ptr, len, p2 + 1).unwrap_or(0) as usize);
+            let list_len = ((read_u8(ptr, len, p2).unwrap_or(0) as usize) << 8)
+                | (read_u8(ptr, len, p2 + 1).unwrap_or(0) as usize);
             if list_len >= 3 && (2 + list_len) <= elen {
                 let mut q = p2 + 2;
-                let name_type = read_u8_user(ptr, len, q).unwrap_or(0);
+                let name_type = read_u8(ptr, len, q).unwrap_or(0);
                 if name_type == 0 {
                     q += 1;
                     if q + 2 <= p2 + elen {
-                        let name_len = ((read_u8_user(ptr, len, q).unwrap_or(0) as usize) << 8)
-                            | (read_u8_user(ptr, len, q + 1).unwrap_or(0) as usize);
+                        let name_len = ((read_u8(ptr, len, q).unwrap_or(0) as usize) << 8)
+                            | (read_u8(ptr, len, q + 1).unwrap_or(0) as usize);
                         q += 2;
 
                         if name_len > 0
                             && name_len <= HOST_LEN
                             && (q + name_len) <= (p2 + elen)
                         {
-                            copy_bytes_from_user(sni_out, HOST_LEN, ptr, len, q, name_len);
+                            copy_bytes_bounded(sni_out, HOST_LEN, ptr, len, q, name_len);
                             return 1;
                         }
                     }
@@ -244,9 +231,9 @@ unsafe fn parse_http_request(
         return;
     }
 
-    let b0 = read_u8_user(ptr, len, 0).unwrap_or(0);
-    let b1 = read_u8_user(ptr, len, 1).unwrap_or(0);
-    let b2 = read_u8_user(ptr, len, 2).unwrap_or(0);
+    let b0 = read_u8(ptr, len, 0).unwrap_or(0);
+    let b1 = read_u8(ptr, len, 1).unwrap_or(0);
+    let b2 = read_u8(ptr, len, 2).unwrap_or(0);
 
     let is_http = (b0 == b'G' && b1 == b'E' && b2 == b'T')
         || (b0 == b'P' && b1 == b'O' && b2 == b'S')
@@ -268,7 +255,7 @@ unsafe fn parse_http_request(
         if si >= len {
             break;
         }
-        let c = read_u8_user(ptr, len, si).unwrap_or(0);
+        let c = read_u8(ptr, len, si).unwrap_or(0);
         if c == b' ' {
             first_space = si;
             break;
@@ -277,7 +264,7 @@ unsafe fn parse_http_request(
 
     // Copy method (<=7 bytes)
     let method_end = if first_space == len { 7usize } else { core::cmp::min(first_space, 7) };
-    copy_bytes_from_user(method_out, 8, ptr, len, 0, method_end);
+    copy_bytes_bounded(method_out, 8, ptr, len, 0, method_end);
 
     // Copy path
     if first_space < len {
@@ -289,14 +276,14 @@ unsafe fn parse_http_request(
                 if pj >= len || pj >= path_start + PATH_LEN {
                     break;
                 }
-                let c = read_u8_user(ptr, len, pj).unwrap_or(0);
+                let c = read_u8(ptr, len, pj).unwrap_or(0);
                 if c == b' ' {
                     path_end = pj;
                     break;
                 }
             }
             let copy_len = path_end.saturating_sub(path_start);
-            copy_bytes_from_user(path_out, PATH_LEN, ptr, len, path_start, copy_len);
+            copy_bytes_bounded(path_out, PATH_LEN, ptr, len, path_start, copy_len);
         }
     }
 
@@ -305,12 +292,12 @@ unsafe fn parse_http_request(
         if hi + 6 > len {
             break;
         }
-        let h0 = read_u8_user(ptr, len, hi).unwrap_or(0);
-        let h1 = read_u8_user(ptr, len, hi + 1).unwrap_or(0);
-        let h2 = read_u8_user(ptr, len, hi + 2).unwrap_or(0);
-        let h3 = read_u8_user(ptr, len, hi + 3).unwrap_or(0);
-        let h4 = read_u8_user(ptr, len, hi + 4).unwrap_or(0);
-        let h5 = read_u8_user(ptr, len, hi + 5).unwrap_or(0);
+        let h0 = read_u8(ptr, len, hi).unwrap_or(0);
+        let h1 = read_u8(ptr, len, hi + 1).unwrap_or(0);
+        let h2 = read_u8(ptr, len, hi + 2).unwrap_or(0);
+        let h3 = read_u8(ptr, len, hi + 3).unwrap_or(0);
+        let h4 = read_u8(ptr, len, hi + 4).unwrap_or(0);
+        let h5 = read_u8(ptr, len, hi + 5).unwrap_or(0);
 
         let is_host_line = (h0 == b'H' || h0 == b'h')
             && (h1 == b'o' || h1 == b'O')
@@ -330,14 +317,14 @@ unsafe fn parse_http_request(
                 if vj >= len || vj >= val_start + HOST_LEN {
                     break;
                 }
-                let c = read_u8_user(ptr, len, vj).unwrap_or(0);
+                let c = read_u8(ptr, len, vj).unwrap_or(0);
                 if c == b'\r' || c == b'\n' {
                     val_end = vj;
                     break;
                 }
             }
             let copy_len = val_end.saturating_sub(val_start);
-            copy_bytes_from_user(host_out, HOST_LEN, ptr, len, val_start, copy_len);
+            copy_bytes_bounded(host_out, HOST_LEN, ptr, len, val_start, copy_len);
             break;
         }
     }
@@ -349,11 +336,11 @@ unsafe fn parse_http_status(ptr: *const u8, len: usize) -> u16 {
     if len < 12 {
         return 0;
     }
-    let h0 = read_u8_user(ptr, len, 0).unwrap_or(0);
-    let h1 = read_u8_user(ptr, len, 1).unwrap_or(0);
-    let h2 = read_u8_user(ptr, len, 2).unwrap_or(0);
-    let h3 = read_u8_user(ptr, len, 3).unwrap_or(0);
-    let h4 = read_u8_user(ptr, len, 4).unwrap_or(0);
+    let h0 = read_u8(ptr, len, 0).unwrap_or(0);
+    let h1 = read_u8(ptr, len, 1).unwrap_or(0);
+    let h2 = read_u8(ptr, len, 2).unwrap_or(0);
+    let h3 = read_u8(ptr, len, 3).unwrap_or(0);
+    let h4 = read_u8(ptr, len, 4).unwrap_or(0);
     if !(h0 == b'H' && h1 == b'T' && h2 == b'T' && h3 == b'P' && h4 == b'/') {
         return 0;
     }
@@ -363,7 +350,7 @@ unsafe fn parse_http_status(ptr: *const u8, len: usize) -> u16 {
         if si >= len {
             break;
         }
-        let c = read_u8_user(ptr, len, si).unwrap_or(0);
+        let c = read_u8(ptr, len, si).unwrap_or(0);
         if c == b' ' {
             status_start = si + 1;
             break;
@@ -373,9 +360,9 @@ unsafe fn parse_http_status(ptr: *const u8, len: usize) -> u16 {
         return 0;
     }
 
-    let a = read_u8_user(ptr, len, status_start).unwrap_or(0);
-    let b = read_u8_user(ptr, len, status_start + 1).unwrap_or(0);
-    let c = read_u8_user(ptr, len, status_start + 2).unwrap_or(0);
+    let a = read_u8(ptr, len, status_start).unwrap_or(0);
+    let b = read_u8(ptr, len, status_start + 1).unwrap_or(0);
+    let c = read_u8(ptr, len, status_start + 2).unwrap_or(0);
 
     if a < b'0' || a > b'9' || b < b'0' || b > b'9' || c < b'0' || c > b'9' {
         return 0;
@@ -439,15 +426,27 @@ pub unsafe extern "C" fn ssl_write_return(ctx: *mut c_void) -> u32 {
     };
 
     let read_len = core::cmp::min(args.len as usize, TLS_SCRATCH_LEN);
-    let uptr = args.buf_ptr as *const u8;
+    let Some(scratch) = TLS_UPROBE_SCRATCH.get_ptr_mut(0) else {
+        return 0;
+    };
+    let dst = addr_of_mut!((*scratch).data) as *mut u8;
+    let pr = gen::bpf_probe_read_user(
+        dst.cast::<c_void>(),
+        read_len as u32,
+        (args.buf_ptr as *const u8).cast::<c_void>(),
+    );
+    if pr != 0 {
+        return 0;
+    }
+    let ptr = dst.cast_const();
 
     // TLS SNI
-    let has_sni = parse_tls_clienthello_sni(uptr, read_len, (*st).tls_sni.as_mut_ptr());
+    let has_sni = parse_tls_clienthello_sni(ptr, read_len, (*st).tls_sni.as_mut_ptr());
 
     // HTTP request
     let mut has_http: u8 = 0;
     parse_http_request(
-        uptr,
+        ptr,
         read_len,
         (*st).http_host.as_mut_ptr(),
         (*st).http_method.as_mut_ptr(),
@@ -460,8 +459,8 @@ pub unsafe extern "C" fn ssl_write_return(ctx: *mut c_void) -> u32 {
     if has_sni != 0 {
         has_tls = 1;
     } else if read_len >= 6 {
-        let b0 = read_u8_user(uptr, read_len, 0).unwrap_or(0);
-        let b5 = read_u8_user(uptr, read_len, 5).unwrap_or(0);
+        let b0 = read_u8(ptr, read_len, 0).unwrap_or(0);
+        let b5 = read_u8(ptr, read_len, 5).unwrap_or(0);
         if b0 == 0x16 && b5 == 0x01 {
             has_tls = 1;
         }
@@ -530,14 +529,25 @@ pub unsafe extern "C" fn ssl_read_return(ctx: *mut c_void) -> u32 {
     let _ = SSL_READ_ARGS.remove(&pid_tgid);
 
     let read_len = core::cmp::min(ret as usize, TLS_SCRATCH_LEN);
-    let uptr = args.buf_ptr as *const u8;
+    let Some(scratch) = TLS_UPROBE_SCRATCH.get_ptr_mut(0) else {
+        return 0;
+    };
+    let dst = addr_of_mut!((*scratch).data) as *mut u8;
+    let pr = gen::bpf_probe_read_user(
+        dst.cast::<c_void>(),
+        read_len as u32,
+        (args.buf_ptr as *const u8).cast::<c_void>(),
+    );
+    if pr != 0 {
+        return 0;
+    }
 
     let flow_key = match TLS_THREAD_FLOW.get(&pid_tgid) {
         Some(k) => *k,
         None => return 0,
     };
 
-    let status = parse_http_status(uptr, read_len);
+    let status = parse_http_status(dst.cast_const(), read_len);
     if status == 0 {
         return 0;
     }
