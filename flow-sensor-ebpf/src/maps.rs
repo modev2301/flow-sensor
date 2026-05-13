@@ -160,10 +160,11 @@ pub static TLS_THREAD_FLOW: HashMap<u64, FlowKey> = HashMap::with_max_entries(81
 /// Must live in a map: on Linux ≤5.15 the verifier rejects **variable-offset reads from the stack**
 /// (`read_u8` → `ptr.add(idx)`), which TLS parsing needs.
 ///
-/// **512 (not 256):** the 5.15 verifier tracks `sess_len` as full `u8` range when proving map
-/// accesses; `session_id` + later fixed offsets can reach **~300** past the buffer base even when
-/// runtime checks would reject oversized sessions — `value_size=256` then fails with `off=300`.
-pub const TLS_SCRATCH_LEN: usize = 512;
+/// Size is driven by the **5.15 verifier**, not only by real TLS record sizes: it tracks `u8`
+/// lengths and pointer chains through ClientHello + extensions conservatively. We already hit
+/// `value_size=256` at `off=300`, then `value_size=512` at **`off=513`**. **1024** leaves margin for
+/// similar `base + var + const` paths without ballooning past typical verifier limits.
+pub const TLS_SCRATCH_LEN: usize = 1024;
 
 #[repr(C)]
 pub struct TlsUprobeScratch {
