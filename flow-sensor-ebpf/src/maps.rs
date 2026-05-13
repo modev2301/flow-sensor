@@ -159,7 +159,11 @@ pub static TLS_THREAD_FLOW: HashMap<u64, FlowKey> = HashMap::with_max_entries(81
 /// Plaintext scratch for `SSL_write` / `SSL_read` uprobes (`bpf_probe_read_user` target).
 /// Must live in a map: on Linux ≤5.15 the verifier rejects **variable-offset reads from the stack**
 /// (`read_u8` → `ptr.add(idx)`), which TLS parsing needs.
-pub const TLS_SCRATCH_LEN: usize = 256;
+///
+/// **512 (not 256):** the 5.15 verifier tracks `sess_len` as full `u8` range when proving map
+/// accesses; `session_id` + later fixed offsets can reach **~300** past the buffer base even when
+/// runtime checks would reject oversized sessions — `value_size=256` then fails with `off=300`.
+pub const TLS_SCRATCH_LEN: usize = 512;
 
 #[repr(C)]
 pub struct TlsUprobeScratch {
