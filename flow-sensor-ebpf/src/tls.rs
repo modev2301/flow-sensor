@@ -81,6 +81,9 @@ unsafe fn parse_tls_clienthello_sni(ptr: *const u8, len: usize, sni_out: *mut u8
     }
 
     let rec_len = ((b3 as usize) << 8) | (b4 as usize);
+    if rec_len > len.saturating_sub(5) {
+        return 0;
+    }
     let rec_end = 5usize.saturating_add(rec_len);
     if rec_end > len {
         return 0;
@@ -128,8 +131,8 @@ unsafe fn parse_tls_clienthello_sni(ptr: *const u8, len: usize, sni_out: *mut u8
     let cs_len = ((read_u8(ptr, len, p).unwrap_or(0) as usize) << 8)
         | (read_u8(ptr, len, p + 1).unwrap_or(0) as usize);
     p += 2;
-    // Cap list size so the verifier cannot treat `cs_len` as ~64Ki while proving map accesses.
-    if cs_len > 512 {
+    // Cap list size (verifier can otherwise carry u16-sized hops when proving map accesses).
+    if cs_len > 200 {
         return 0;
     }
     if p + cs_len > len {
@@ -158,6 +161,11 @@ unsafe fn parse_tls_clienthello_sni(ptr: *const u8, len: usize, sni_out: *mut u8
     let ext_total = ((read_u8(ptr, len, p).unwrap_or(0) as usize) << 8)
         | (read_u8(ptr, len, p + 1).unwrap_or(0) as usize);
     p += 2;
+    // Absolute cap: first TLS plaintext chunk is ≤ TLS_SCRATCH_LEN bytes; extensions cannot span
+    // beyond what fits — but 5.15 may still widen `ext_total` unless bounded independently of `len`.
+    if ext_total > 220 {
+        return 0;
+    }
     let ext_end = p.saturating_add(ext_total);
     if ext_end > len {
         return 0;
@@ -165,7 +173,7 @@ unsafe fn parse_tls_clienthello_sni(ptr: *const u8, len: usize, sni_out: *mut u8
 
     // scan extensions (bounded loop)
     let mut p2 = p;
-    for _ in 0..48usize {
+    for _ in 0..24usize {
         if p2 + 4 > ext_end {
             break;
         }
@@ -176,7 +184,7 @@ unsafe fn parse_tls_clienthello_sni(ptr: *const u8, len: usize, sni_out: *mut u8
             | (read_u8(ptr, len, p2 + 3).unwrap_or(0) as usize);
         p2 += 4;
 
-        if elen > 2048 {
+        if elen > 128 {
             return 0;
         }
         if p2 + elen > ext_end {

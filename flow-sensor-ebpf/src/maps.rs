@@ -160,10 +160,9 @@ pub static TLS_THREAD_FLOW: HashMap<u64, FlowKey> = HashMap::with_max_entries(81
 pub const TLS_SCRATCH_LEN: usize = 256;
 
 /// Trailing bytes in `TlsUprobeScratch` (not written by the bulk copy). Linux 5.15’s verifier can
-/// still prove a load one past the last byte used in TLS parsing; padding keeps that proof inside
-/// the map `value_size` without per-byte `bpf_probe_read_user` (which blows past the 1M verifier
-/// insn budget).
-const TLS_SCRATCH_PAD: usize = 128;
+/// still widen pointer offsets across ClientHello + extensions; keep `value_size` comfortably
+/// above any observed `off=` from the verifier (e.g. ~2.3Ki past base) without per-byte user reads.
+const TLS_SCRATCH_PAD: usize = 2112;
 
 #[repr(C)]
 pub struct TlsUprobeScratch {
