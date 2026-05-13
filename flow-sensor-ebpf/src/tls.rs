@@ -107,12 +107,15 @@ unsafe fn parse_tls_clienthello_sni(ptr: *const u8, len: usize, sni_out: *mut u8
     }
     p += 32;
 
-    // session id
+    // session id (RFC 5246 / 8446: opaque SessionID <0..32>)
     if p + 1 > len {
         return 0;
     }
     let sess_len = read_u8(ptr, len, p).unwrap_or(0) as usize;
     p += 1;
+    if sess_len > 32 {
+        return 0;
+    }
     if p + sess_len > len {
         return 0;
     }
@@ -125,17 +128,24 @@ unsafe fn parse_tls_clienthello_sni(ptr: *const u8, len: usize, sni_out: *mut u8
     let cs_len = ((read_u8(ptr, len, p).unwrap_or(0) as usize) << 8)
         | (read_u8(ptr, len, p + 1).unwrap_or(0) as usize);
     p += 2;
+    // Cap list size so the verifier cannot treat `cs_len` as ~64Ki while proving map accesses.
+    if cs_len > 512 {
+        return 0;
+    }
     if p + cs_len > len {
         return 0;
     }
     p += cs_len;
 
-    // compression methods
+    // compression methods (length byte + methods; in practice ≤2; cap for verifier)
     if p + 1 > len {
         return 0;
     }
     let comp_len = read_u8(ptr, len, p).unwrap_or(0) as usize;
     p += 1;
+    if comp_len > 32 {
+        return 0;
+    }
     if p + comp_len > len {
         return 0;
     }
@@ -166,6 +176,9 @@ unsafe fn parse_tls_clienthello_sni(ptr: *const u8, len: usize, sni_out: *mut u8
             | (read_u8(ptr, len, p2 + 3).unwrap_or(0) as usize);
         p2 += 4;
 
+        if elen > 2048 {
+            return 0;
+        }
         if p2 + elen > ext_end {
             return 0;
         }

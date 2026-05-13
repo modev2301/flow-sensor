@@ -160,11 +160,10 @@ pub static TLS_THREAD_FLOW: HashMap<u64, FlowKey> = HashMap::with_max_entries(81
 /// Must live in a map: on Linux ≤5.15 the verifier rejects **variable-offset reads from the stack**
 /// (`read_u8` → `ptr.add(idx)`), which TLS parsing needs.
 ///
-/// Size is driven by the **5.15 verifier**, not only by real TLS record sizes: it tracks `u8`
-/// lengths and pointer chains through ClientHello + extensions conservatively. We already hit
-/// `value_size=256` at `off=300`, then `value_size=512` at **`off=513`**. **1024** leaves margin for
-/// similar `base + var + const` paths without ballooning past typical verifier limits.
-pub const TLS_SCRATCH_LEN: usize = 1024;
+/// Keep this modest: `parse_tls_clienthello_sni` applies **RFC length caps** (e.g. session id ≤32)
+/// so the 5.15 verifier does not assume `u8::MAX` hops through the buffer — inflating only the map
+/// does not fix `off=value_size+1` failures from `*(ptr + end + 1)`-style lowered loads.
+pub const TLS_SCRATCH_LEN: usize = 256;
 
 #[repr(C)]
 pub struct TlsUprobeScratch {
