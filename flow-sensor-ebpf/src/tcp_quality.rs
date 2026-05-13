@@ -16,7 +16,16 @@ pub(crate) const TCP_SRTT_US_OFFSET: usize = 0x1E0; // srtt_us (smoothed RTT << 
 const TCP_RTTVAR_US_OFFSET: usize = 0x1E4; // rttvar_us (variance << 2)
 const TCP_SND_CWND_OFFSET: usize = 0x1AC;   // snd_cwnd
 const TCP_ICSK_CA_STATE_OFFSET: usize = 0x164; // inet_csk.icsk_ca_state
+// ── inet_sock / sock offsets ─────────────────────────────────────────────
+// Must match kernel layout used elsewhere (tcp_lifecycle, retransmit, etc)
 
+const INET_DADDR_OFFSET: usize = 0x0;  // inet_daddr
+const INET_SADDR_OFFSET: usize = 0x4;  // inet_saddr
+const INET_DPORT_OFFSET: usize = 0xA;  // inet_dport (network byte order)
+const INET_SPORT_OFFSET: usize = 0xC;  // inet_sport (network byte order)
+
+// struct sock
+const SK_PROTO_OFFSET: usize = 0x3;    // sk_protocol
 /// Fires on every established TCP ACK received.
 /// This is the highest-frequency hook — be efficient.
 #[kprobe(function = "tcp_rcv_established")]
@@ -41,7 +50,11 @@ unsafe fn handle_rcv_established(ctx: &ProbeContext) -> Result<u32, i64> {
     let rttvar_us = rttvar_us_raw >> 2;
 
     // Extract flow key from sock
-    let key = flow_key_from_sk(sk)?;
+    let mut key = core::mem::MaybeUninit::<FlowKey>::uninit();
+    if !flow_key_from_sk(sk, key.as_mut_ptr()) {
+        return Err(-1);
+    }
+    let key = unsafe { key.assume_init() };
 
     if let Some(state) = FLOW_TABLE.get_ptr_mut(&key) {
         let s = &mut *state;
@@ -80,7 +93,11 @@ pub fn tcp_enter_cwr(ctx: ProbeContext) -> u32 {
 
 unsafe fn handle_ecn(ctx: &ProbeContext) -> Result<u32, i64> {
     let sk = ctx.arg::<*const u8>(0).ok_or(-1)?;
-    let key = flow_key_from_sk(sk)?;
+    let mut key = core::mem::MaybeUninit::<FlowKey>::uninit();
+    if !flow_key_from_sk(sk, key.as_mut_ptr()) {
+        return Err(-1);
+    }
+let key = unsafe { key.assume_init() };
 
     if let Some(state) = FLOW_TABLE.get_ptr_mut(&key) {
         (*state).ecn_signals = (*state).ecn_signals.saturating_add(1);
@@ -99,7 +116,11 @@ pub fn tcp_enter_loss(ctx: ProbeContext) -> u32 {
 
 unsafe fn handle_enter_loss(ctx: &ProbeContext) -> Result<u32, i64> {
     let sk = ctx.arg::<*const u8>(0).ok_or(-1)?;
-    let key = flow_key_from_sk(sk)?;
+    let mut key = core::mem::MaybeUninit::<FlowKey>::uninit();
+    if !flow_key_from_sk(sk, key.as_mut_ptr()) {
+        return Err(-1);
+    }
+let key = unsafe { key.assume_init() };
 
     if let Some(state) = FLOW_TABLE.get_ptr_mut(&key) {
         (*state).congestion_state_final = CongestionState::Loss as u8;
@@ -118,7 +139,11 @@ pub fn tcp_enter_recovery(ctx: ProbeContext) -> u32 {
 
 unsafe fn handle_enter_recovery(ctx: &ProbeContext) -> Result<u32, i64> {
     let sk = ctx.arg::<*const u8>(0).ok_or(-1)?;
-    let key = flow_key_from_sk(sk)?;
+    let mut key = core::mem::MaybeUninit::<FlowKey>::uninit();
+    if !flow_key_from_sk(sk, key.as_mut_ptr()) {
+        return Err(-1);
+}
+let key = unsafe { key.assume_init() };
 
     if let Some(state) = FLOW_TABLE.get_ptr_mut(&key) {
         (*state).congestion_state_final = CongestionState::Recovery as u8;
@@ -129,26 +154,44 @@ unsafe fn handle_enter_recovery(ctx: &ProbeContext) -> Result<u32, i64> {
 // ── Helper ───────────────────────────────────────────────────────────────────
 
 /// Extract FlowKey from a raw sock pointer using known struct offsets
-pub(crate) unsafe fn flow_key_from_sk(sk: *const u8) -> Result<FlowKey, i64> {
-    // inet_sock offsets (stable across 5.8-6.x)
-    const INET_DADDR_OFFSET: usize = 0x0;
-    const INET_SADDR_OFFSET: usize = 0x4;
-    const INET_DPORT_OFFSET: usize = 0xA;
-    const INET_SPORT_OFFSET: usize = 0xC;
-    const SK_PROTO_OFFSET: usize = 0x23;
+pub(crate) unsafe fn flow_key_from_sk(
+    sk: *const u8,
+    out: *mut FlowKey,
+) -> bool {
+    // NOTE: no '?' here; return false on any failed read
+    let dst_ip = match kread::read_u32_ne(sk.add(INET_DADDR_OFFSET)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let src_ip = match kread::read_u32_ne(sk.add(INET_SADDR_OFFSET)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let dst_port = match kread::read_u16_ne(sk.add(INET_DPORT_OFFSET)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let src_port = match kread::read_u16_ne(sk.add(INET_SPORT_OFFSET)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let protocol = match kread::read_u8(sk.add(SK_PROTO_OFFSET)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
 
-    let dst_ip = kread::read_u32_ne(sk.add(INET_DADDR_OFFSET))?;
-    let src_ip = kread::read_u32_ne(sk.add(INET_SADDR_OFFSET))?;
-    let dst_port = kread::read_u16_ne(sk.add(INET_DPORT_OFFSET))?;
-    let src_port = kread::read_u16_ne(sk.add(INET_SPORT_OFFSET))?;
-    let protocol = kread::read_u8(sk.add(SK_PROTO_OFFSET))?;
+    (*out).src_ip = src_ip;
+    (*out).dst_ip = dst_ip;
+    (*out).src_port = u16::from_be(src_port);
+    (*out).dst_port = u16::from_be(dst_port);
+    (*out).protocol = protocol;
 
-    Ok(FlowKey {
-        src_ip,
-        dst_ip,
-        src_port: u16::from_be(src_port),
-        dst_port: u16::from_be(dst_port),
-        protocol,
-        _pad: [0; 3],
-    })
+    // explicit padding writes (avoid memset/stack-return helpers)
+    let pad = core::ptr::addr_of_mut!((*out)._pad) as *mut u8;
+    core::ptr::write(pad.add(0), 0);
+    core::ptr::write(pad.add(1), 0);
+    core::ptr::write(pad.add(2), 0);
+
+    true
 }
+

@@ -48,7 +48,11 @@ unsafe fn handle_retransmit(
     reason: RetransmitReason,
 ) -> Result<u32, i64> {
     let sk = ctx.arg::<*const u8>(0).ok_or(-1)?;
-    let key = flow_key_from_sk(sk)?;
+    let mut key = core::mem::MaybeUninit::<crate::maps::FlowKey>::uninit();
+    if !flow_key_from_sk(sk, key.as_mut_ptr()) {
+        return Ok(0);
+    }
+    let key = key.assume_init();
 
     // Read retransmit context from tcp_sock
     let srtt_us_raw = kread::read_u32_ne(sk.add(crate::tcp_quality::TCP_SRTT_US_OFFSET)).unwrap_or(0);
@@ -93,7 +97,11 @@ pub fn tcp_sacktag(ctx: ProbeContext) -> u32 {
 
 unsafe fn handle_sack(ctx: &ProbeContext) -> Result<u32, i64> {
     let sk = ctx.arg::<*const u8>(0).ok_or(-1)?;
-    let key = flow_key_from_sk(sk)?;
+    let mut key = core::mem::MaybeUninit::<crate::maps::FlowKey>::uninit();
+    if !flow_key_from_sk(sk, key.as_mut_ptr()) {
+        return Ok(0);
+    }
+    let key = key.assume_init();
 
     if let Some(state) = FLOW_TABLE.get_ptr_mut(&key) {
         (*state).sack_blocks_received = (*state).sack_blocks_received.saturating_add(1);

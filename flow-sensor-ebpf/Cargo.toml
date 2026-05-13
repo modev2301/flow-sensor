@@ -1,3 +1,4 @@
+cargo-features = ["panic-immediate-abort"]
 [package]
 name = "flow-sensor-ebpf"
 version = "0.1.0"
@@ -12,15 +13,8 @@ crate-type = ["cdylib"]
 aya-ebpf = { version = "0.1.1", default-features = false }
 flow-sensor-common = { path = "../flow-sensor-common", default-features = false }
 
-# Aggressive LTO can interact badly with bpf-linker: uretprobe entry may become a tiny stub while
-# the real body is a separate BPF subprogram (verifier: "last insn is not an exit", 0 insns).
-#
-# `panic = "abort"` avoids rustc emitting panic/unwind glue that bpf-linker can place in
-# `.text.unlikely` after your program’s final `exit` (dead `call -2` / `panic_fmt` tail → Linux 5.15
-# `check_subprogs` / “last insn is not an exit or jmp”). Pair with `-Z build-std-features=panic_immediate_abort`
-# in the eBPF build so `core` is built the same way (see `./build.sh`).
 [profile.release]
 lto = false
 opt-level = 3
 codegen-units = 1
-panic = "abort"
+panic = "immediate-abort"

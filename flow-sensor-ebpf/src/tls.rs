@@ -1,32 +1,43 @@
 //! TLS uprobes — intercept SSL_write/SSL_read to extract plaintext context.
 //! Attached to libssl.so in target processes.
-//! This is how we see through proxies: we hook the proxy process's TLS library.
-//!
 //! Outbound `FlowKey` is taken from `TLS_THREAD_FLOW` (set in `tcp_connect` on the same thread).
 //! Parses TLS ClientHello SNI plus minimal HTTP from cleartext application data.
+//
+// NOTE:
+// - DO NOT put `#![no_std]` here. That belongs in crate root (lib.rs / main.rs).
+// - Avoid dynamic slicing + copy_from_slice: they can introduce trap paths => __bpf_trap on older kernels.
+#[inline(always)]
+unsafe fn copy_bytes_bounded(
+    out: *mut u8,
+    out_len: usize,
+    src: *const u8,
+    src_len: usize,
+    start: usize,
+    cnt: usize,
+) {
+    let mut i = 0usize;
+    while i < cnt && i < out_len && start + i < src_len {
+        *out.add(i) = *src.add(start + i);
+        i += 1;
+    }
+}
+
 
 use core::ffi::c_void;
 
 use aya_ebpf::{
-    helpers::{
-        bpf_get_current_pid_tgid, bpf_ktime_get_ns,
-        bpf_probe_read_user_buf,
-    },
+    helpers::{bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_user_buf},
     macros::{map, uprobe},
     maps::HashMap,
     programs::{ProbeContext, RetProbeContext},
 };
-use flow_sensor_common::*;
 
+use flow_sensor_common::*;
 use crate::maps::{FLOW_TABLE, TLS_THREAD_FLOW};
 
 /// Max bytes copied from userspace per SSL hook.
-/// Keep small: the BPF stack is 512B by default; `ssl_write_return` must not hold scratch + full
-/// `HOST_LEN`/`PATH_LEN` copies at once (stack pressure).
 const TLS_SCRATCH_LEN: usize = 256;
 
-/// `#[repr(C)]` with explicit padding so every byte is initialized on the stack.
-/// Implicit padding after `len` would leave holes and make `bpf_map_update_elem` fail verification.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SslArgs {
@@ -44,298 +55,318 @@ static SSL_WRITE_ARGS: HashMap<u64, SslArgs> = HashMap::with_max_entries(4096, 0
 #[map]
 static SSL_READ_ARGS: HashMap<u64, SslArgs> = HashMap::with_max_entries(4096, 0);
 
-// ── TLS ClientHello SNI + HTTP (macro-expanded) ─────────────────────────────
-//
-// Linux's BPF verifier runs `check_subprogs()` before simulating instructions. If LLVM emits
-// BPF-to-BPF calls, each subprogram's last insn must be EXIT or unconditional JA; otherwise the
-// kernel prints `last insn is not an exit or jmp` and then `processed 0 insns` (stats only).
-// `macro_rules!` keeps logic in one Rust `fn` per probe. Avoid iterators/closures **and** `while`
-// loops: LLVM's BPF backend can outline `while` bodies into separate `.text` subprograms; Linux
-// 5.15 `check_subprogs()` then rejects a subprogram whose last insn is not `exit` or unconditional
-// `ja`. Use **const-bound `for`** (`for i in 0..N` with fixed `N`) so the trip count is known at
-// compile time and codegen stays in one BPF program.
+#[inline(always)]
+unsafe fn read_u8(ptr: *const u8, len: usize, idx: usize) -> Option<u8> {
+    if idx < len {
+        Some(core::ptr::read_unaligned(ptr.add(idx)))
+    } else {
+        None
+    }
+}
 
-macro_rules! parse_tls_clienthello_sni {
-    ($buf:expr, $sni_out:expr) => {{
-        let buf: &[u8] = $buf;
-        let sni_out: &mut [u8; HOST_LEN] = $sni_out;
-        let max = buf.len().min(TLS_SCRATCH_LEN);
-        if max < 43 {
-            0u8
-        } else {
-            let buf = &buf[..max];
-            if buf[0] != 0x16 || buf[1] != 0x03 {
-                0u8
-            } else {
-                let rec_len = ((buf[3] as usize) << 8) | (buf[4] as usize);
-                let _rec_end = 5usize.saturating_add(rec_len);
-                if _rec_end > buf.len() || buf[5] != 0x01 {
-                    0u8
-                } else {
-                    let mut p: usize = 9;
-                    if p + 2 > buf.len() {
-                        0u8
-                    } else {
-                        p += 2;
-                        if p + 32 > buf.len() {
-                            0u8
-                        } else {
-                            p += 32;
-                            if p + 1 > buf.len() {
-                                0u8
-                            } else {
-                                let sess_len = buf[p] as usize;
-                                p += 1;
-                                if p + sess_len > buf.len() {
-                                    0u8
-                                } else {
-                                    p += sess_len;
-                                    if p + 2 > buf.len() {
-                                        0u8
-                                    } else {
-                                        let cs_len = ((buf[p] as usize) << 8) | (buf[p + 1] as usize);
-                                        p += 2;
-                                        if p + cs_len > buf.len() {
-                                            0u8
-                                        } else {
-                                            p += cs_len;
-                                            if p + 1 > buf.len() {
-                                                0u8
-                                            } else {
-                                                let comp_len = buf[p] as usize;
-                                                p += 1;
-                                                if p + comp_len > buf.len() {
-                                                    0u8
-                                                } else {
-                                                    p += comp_len;
-                                                    if p + 2 > buf.len() {
-                                                        0u8
-                                                    } else {
-                                                        let ext_total =
-                                                            ((buf[p] as usize) << 8) | (buf[p + 1] as usize);
-                                                        p += 2;
-                                                        let ext_end = p.saturating_add(ext_total);
-                                                        if ext_end > buf.len() {
-                                                            0u8
-                                                        } else {
-                                                            let mut found = 0u8;
-                                                            let mut p2 = p;
-                                                            for _ext_i in 0..48usize {
-                                                                if p2 + 4 > ext_end
-                                                                    || p2 + 4 > buf.len()
-                                                                {
-                                                                    break;
-                                                                }
-                                                                let etype = ((buf[p2] as u16) << 8)
-                                                                    | (buf[p2 + 1] as u16);
-                                                                let elen = ((buf[p2 + 2] as usize)
-                                                                    << 8)
-                                                                    | (buf[p2 + 3] as usize);
-                                                                p2 += 4;
-                                                                if p2 + elen > buf.len()
-                                                                    || p2 + elen > ext_end
-                                                                {
-                                                                    found = 0;
-                                                                    break;
-                                                                }
-                                                                if etype == 0 {
-                                                                    let ep = &buf[p2..p2 + elen];
-                                                                    if ep.len() >= 5 {
-                                                                        let list_len = ((ep[0]
-                                                                            as usize)
-                                                                            << 8)
-                                                                            | (ep[1] as usize);
-                                                                        if list_len >= 3
-                                                                            && 2 + list_len
-                                                                                <= ep.len()
-                                                                        {
-                                                                            let mut q: usize = 2;
-                                                                            if ep[q] == 0 {
-                                                                                q += 1;
-                                                                                if q + 2
-                                                                                    <= ep.len()
-                                                                                {
-                                                                                    let name_len = ((ep[q] as usize) << 8)
-                                                                                        | (ep[q + 1] as usize);
-                                                                                    q += 2;
-                                                                                    if name_len > 0
-                                                                                        && name_len
-                                                                                            <= HOST_LEN
-                                                                                        && q + name_len
-                                                                                            <= ep.len()
-                                                                                    {
-                                                                                        sni_out[..name_len]
-                                                                                            .copy_from_slice(
-                                                                                                &ep[q..q
-                                                                                                    + name_len],
-                                                                                            );
-                                                                                        found = 1;
-                                                                                        break;
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                                p2 += elen;
-                                                            }
-                                                            found
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+#[inline(always)]
+unsafe fn write_u8(dst: *mut u8, idx: usize, val: u8) {
+    core::ptr::write_unaligned(dst.add(idx), val);
+}
+
+#[inline(always)]
+
+/// Parse TLS ClientHello SNI from first `len` bytes. Copy into `sni_out` (HOST_LEN).
+/// Returns 1 if found/copied, else 0.
+#[inline(always)]
+unsafe fn parse_tls_clienthello_sni(ptr: *const u8, len: usize, sni_out: *mut u8) -> u8 {
+    if len < 43 {
+        return 0;
+    }
+
+    // TLS record header
+    let b0 = read_u8(ptr, len, 0).unwrap_or(0);
+    let b1 = read_u8(ptr, len, 1).unwrap_or(0);
+    let b3 = read_u8(ptr, len, 3).unwrap_or(0);
+    let b4 = read_u8(ptr, len, 4).unwrap_or(0);
+
+    if b0 != 0x16 || b1 != 0x03 {
+        return 0;
+    }
+
+    let rec_len = ((b3 as usize) << 8) | (b4 as usize);
+    let rec_end = 5usize.saturating_add(rec_len);
+    if rec_end > len {
+        return 0;
+    }
+
+    // handshake type
+    let hs = read_u8(ptr, len, 5).unwrap_or(0);
+    if hs != 0x01 {
+        return 0;
+    }
+
+    // Your original logic effectively starts at p=9
+    let mut p: usize = 9;
+
+    // skip client version (2)
+    if p + 2 > len {
+        return 0;
+    }
+    p += 2;
+
+    // skip random (32)
+    if p + 32 > len {
+        return 0;
+    }
+    p += 32;
+
+    // session id
+    if p + 1 > len {
+        return 0;
+    }
+    let sess_len = read_u8(ptr, len, p).unwrap_or(0) as usize;
+    p += 1;
+    if p + sess_len > len {
+        return 0;
+    }
+    p += sess_len;
+
+    // cipher suites
+    if p + 2 > len {
+        return 0;
+    }
+    let cs_len = ((read_u8(ptr, len, p).unwrap_or(0) as usize) << 8)
+        | (read_u8(ptr, len, p + 1).unwrap_or(0) as usize);
+    p += 2;
+    if p + cs_len > len {
+        return 0;
+    }
+    p += cs_len;
+
+    // compression methods
+    if p + 1 > len {
+        return 0;
+    }
+    let comp_len = read_u8(ptr, len, p).unwrap_or(0) as usize;
+    p += 1;
+    if p + comp_len > len {
+        return 0;
+    }
+    p += comp_len;
+
+    // extensions total
+    if p + 2 > len {
+        return 0;
+    }
+    let ext_total = ((read_u8(ptr, len, p).unwrap_or(0) as usize) << 8)
+        | (read_u8(ptr, len, p + 1).unwrap_or(0) as usize);
+    p += 2;
+    let ext_end = p.saturating_add(ext_total);
+    if ext_end > len {
+        return 0;
+    }
+
+    // scan extensions (bounded loop)
+    let mut p2 = p;
+    for _ in 0..48usize {
+        if p2 + 4 > ext_end {
+            break;
+        }
+
+        let etype = ((read_u8(ptr, len, p2).unwrap_or(0) as u16) << 8)
+            | (read_u8(ptr, len, p2 + 1).unwrap_or(0) as u16);
+        let elen = ((read_u8(ptr, len, p2 + 2).unwrap_or(0) as usize) << 8)
+            | (read_u8(ptr, len, p2 + 3).unwrap_or(0) as usize);
+        p2 += 4;
+
+        if p2 + elen > ext_end {
+            return 0;
+        }
+
+        // server_name extension
+        if etype == 0 && elen >= 5 {
+            // list_len (2) at p2, then name_type (1), then name_len (2), then name bytes
+            let list_len = ((read_u8(ptr, len, p2).unwrap_or(0) as usize) << 8)
+                | (read_u8(ptr, len, p2 + 1).unwrap_or(0) as usize);
+            if list_len >= 3 && (2 + list_len) <= elen {
+                let mut q = p2 + 2;
+                let name_type = read_u8(ptr, len, q).unwrap_or(0);
+                if name_type == 0 {
+                    q += 1;
+                    if q + 2 <= p2 + elen {
+                        let name_len = ((read_u8(ptr, len, q).unwrap_or(0) as usize) << 8)
+                            | (read_u8(ptr, len, q + 1).unwrap_or(0) as usize);
+                        q += 2;
+
+                        if name_len > 0
+                            && name_len <= HOST_LEN
+                            && (q + name_len) <= (p2 + elen)
+                        {
+                            copy_bytes_bounded(sni_out.as_mut_ptr(), HOST_LEN, ptr, len, len, q, name_len);
+                            return 1;
                         }
                     }
                 }
             }
         }
-    }};
+
+        p2 += elen;
+    }
+
+    0
 }
 
-macro_rules! parse_http_request {
-    (
-        $buf:expr,
-        $host_out:expr,
-        $method_out:expr,
-        $path_out:expr,
-        $has_http:expr
-    ) => {{
-        let buf: &[u8] = $buf;
-        let host_out: &mut [u8; HOST_LEN] = $host_out;
-        let method_out: &mut [u8; 8] = $method_out;
-        let path_out: &mut [u8; PATH_LEN] = $path_out;
-        let has_http: &mut u8 = $has_http;
-        if buf.len() >= 4 {
-            let b0 = buf[0];
-            let b1 = buf[1];
-            let b2 = buf[2];
-            let is_http = (b0 == b'G' && b1 == b'E' && b2 == b'T')
-                || (b0 == b'P' && b1 == b'O' && b2 == b'S')
-                || (b0 == b'P' && b1 == b'U' && b2 == b'T')
-                || (b0 == b'D' && b1 == b'E' && b2 == b'L')
-                || (b0 == b'P' && b1 == b'A' && b2 == b'T')
-                || (b0 == b'H' && b1 == b'E' && b2 == b'A')
-                || (b0 == b'O' && b1 == b'P' && b2 == b'T');
-            if is_http {
-                *has_http = 1;
-                let mut first_space: usize = buf.len();
-                for si in 0..TLS_SCRATCH_LEN {
-                    if si >= buf.len() {
-                        break;
-                    }
-                    if buf[si] == b' ' {
-                        first_space = si;
-                        break;
-                    }
-                }
-                let method_end = if first_space == buf.len() {
-                    7usize
-                } else {
-                    core::cmp::min(first_space, 7)
-                };
-                let method_copy = core::cmp::min(method_end, buf.len());
-                method_out[..method_copy].copy_from_slice(&buf[..method_copy]);
-                if first_space < buf.len() {
-                    let path_start = first_space + 1;
-                    if path_start < buf.len() {
-                        let mut path_end =
-                            core::cmp::min(path_start.saturating_add(PATH_LEN), buf.len());
-                        for off in 0..PATH_LEN {
-                            let pj = path_start + off;
-                            if pj >= buf.len() || pj >= path_start + PATH_LEN {
-                                break;
-                            }
-                            if buf[pj] == b' ' {
-                                path_end = pj;
-                                break;
-                            }
-                        }
-                        let copy_len = (path_end - path_start).min(PATH_LEN);
-                        path_out[..copy_len]
-                            .copy_from_slice(&buf[path_start..path_start + copy_len]);
-                    }
-                }
-                for hi in 0..400usize {
-                    if hi + 6 > buf.len() {
-                        break;
-                    }
-                    let h0 = buf[hi];
-                    let h1 = buf[hi + 1];
-                    let h2 = buf[hi + 2];
-                    let h3 = buf[hi + 3];
-                    let h4 = buf[hi + 4];
-                    let h5 = buf[hi + 5];
-                    let is_host_line = (h0 == b'H' || h0 == b'h')
-                        && (h1 == b'o' || h1 == b'O')
-                        && (h2 == b's' || h2 == b'S')
-                        && (h3 == b't' || h3 == b'T')
-                        && h4 == b':'
-                        && h5 == b' ';
-                    if is_host_line {
-                        let val_start = hi + 6;
-                        if val_start < buf.len() {
-                            let mut val_end =
-                                core::cmp::min(val_start.saturating_add(HOST_LEN), buf.len());
-                            for off in 0..HOST_LEN {
-                                let vj = val_start + off;
-                                if vj >= buf.len() || vj >= val_start + HOST_LEN {
-                                    break;
-                                }
-                                let c = buf[vj];
-                                if c == b'\r' || c == b'\n' {
-                                    val_end = vj;
-                                    break;
-                                }
-                            }
-                            let copy_len = (val_end - val_start).min(HOST_LEN);
-                            host_out[..copy_len]
-                                .copy_from_slice(&buf[val_start..val_start + copy_len]);
-                        }
-                        break;
-                    }
-                }
-            }
+/// Parse minimal HTTP request: method, path, host.
+/// Writes directly to output buffers with bounded loops; sets `*has_http=1` if looks like HTTP.
+#[inline(always)]
+unsafe fn parse_http_request(
+    ptr: *const u8,
+    len: usize,
+    host_out: *mut u8,
+    method_out: *mut u8, // 8 bytes
+    path_out: *mut u8,
+    has_http: *mut u8,
+) {
+    if len < 4 {
+        return;
+    }
+
+    let b0 = read_u8(ptr, len, 0).unwrap_or(0);
+    let b1 = read_u8(ptr, len, 1).unwrap_or(0);
+    let b2 = read_u8(ptr, len, 2).unwrap_or(0);
+
+    let is_http = (b0 == b'G' && b1 == b'E' && b2 == b'T')
+        || (b0 == b'P' && b1 == b'O' && b2 == b'S')
+        || (b0 == b'P' && b1 == b'U' && b2 == b'T')
+        || (b0 == b'D' && b1 == b'E' && b2 == b'L')
+        || (b0 == b'P' && b1 == b'A' && b2 == b'T')
+        || (b0 == b'H' && b1 == b'E' && b2 == b'A')
+        || (b0 == b'O' && b1 == b'P' && b2 == b'T');
+
+    if !is_http {
+        return;
+    }
+
+    core::ptr::write_unaligned(has_http, 1u8);
+
+    // Find first space
+    let mut first_space = len;
+    for si in 0..TLS_SCRATCH_LEN {
+        if si >= len {
+            break;
         }
-    }};
-}
+        let c = read_u8(ptr, len, si).unwrap_or(0);
+        if c == b' ' {
+            first_space = si;
+            break;
+        }
+    }
 
-macro_rules! parse_http_status {
-    ($buf:expr) => {{
-        let buf: &[u8] = $buf;
-        if buf.len() < 12 {
-            0u16
-        } else if &buf[0..5] != b"HTTP/" {
-            0u16
-        } else {
-            let mut status_start = 0usize;
-            for si in 5..TLS_SCRATCH_LEN {
-                if si >= buf.len() {
+    // Copy method (<=7 bytes)
+    let method_end = if first_space == len { 7usize } else { core::cmp::min(first_space, 7) };
+    copy_bytes_bounded(method_out.as_mut_ptr(), 8, ptr, len, len, 0, method_end);
+
+    // Copy path
+    if first_space < len {
+        let path_start = first_space + 1;
+        if path_start < len {
+            let mut path_end = core::cmp::min(path_start + PATH_LEN, len);
+            for off in 0..PATH_LEN {
+                let pj = path_start + off;
+                if pj >= len || pj >= path_start + PATH_LEN {
                     break;
                 }
-                if buf[si] == b' ' {
-                    status_start = si + 1;
+                let c = read_u8(ptr, len, pj).unwrap_or(0);
+                if c == b' ' {
+                    path_end = pj;
                     break;
                 }
             }
-            if status_start == 0 || status_start + 3 > buf.len() {
-                0u16
-            } else {
-                let hundreds = (buf[status_start] as u16).wrapping_sub(b'0' as u16);
-                let tens = (buf[status_start + 1] as u16).wrapping_sub(b'0' as u16);
-                let ones = (buf[status_start + 2] as u16).wrapping_sub(b'0' as u16);
-                if hundreds > 9 || tens > 9 || ones > 9 {
-                    0u16
-                } else {
-                    hundreds * 100 + tens * 10 + ones
+            let copy_len = path_end.saturating_sub(path_start);
+            copy_bytes_bounded::<PATH_LEN>(path_out, ptr, len, path_start, copy_len);
+        }
+    }
+
+    // Find Host header: scan first 400 bytes
+    for hi in 0..400usize {
+        if hi + 6 > len {
+            break;
+        }
+        let h0 = read_u8(ptr, len, hi).unwrap_or(0);
+        let h1 = read_u8(ptr, len, hi + 1).unwrap_or(0);
+        let h2 = read_u8(ptr, len, hi + 2).unwrap_or(0);
+        let h3 = read_u8(ptr, len, hi + 3).unwrap_or(0);
+        let h4 = read_u8(ptr, len, hi + 4).unwrap_or(0);
+        let h5 = read_u8(ptr, len, hi + 5).unwrap_or(0);
+
+        let is_host_line = (h0 == b'H' || h0 == b'h')
+            && (h1 == b'o' || h1 == b'O')
+            && (h2 == b's' || h2 == b'S')
+            && (h3 == b't' || h3 == b'T')
+            && h4 == b':'
+            && h5 == b' ';
+
+        if is_host_line {
+            let val_start = hi + 6;
+            if val_start >= len {
+                break;
+            }
+            let mut val_end = core::cmp::min(val_start + HOST_LEN, len);
+            for off in 0..HOST_LEN {
+                let vj = val_start + off;
+                if vj >= len || vj >= val_start + HOST_LEN {
+                    break;
+                }
+                let c = read_u8(ptr, len, vj).unwrap_or(0);
+                if c == b'\r' || c == b'\n' {
+                    val_end = vj;
+                    break;
                 }
             }
+            let copy_len = val_end.saturating_sub(val_start);
+            copy_bytes_bounded(host_out.as_mut_ptr(), HOST_LEN, ptr, len, len, val_start, copy_len);
+            break;
         }
-    }};
+    }
 }
+
+/// Parse HTTP status code from response bytes. Returns 0 if not a response/status not found.
+#[inline(always)]
+unsafe fn parse_http_status(ptr: *const u8, len: usize) -> u16 {
+    if len < 12 {
+        return 0;
+    }
+    let h0 = read_u8(ptr, len, 0).unwrap_or(0);
+    let h1 = read_u8(ptr, len, 1).unwrap_or(0);
+    let h2 = read_u8(ptr, len, 2).unwrap_or(0);
+    let h3 = read_u8(ptr, len, 3).unwrap_or(0);
+    let h4 = read_u8(ptr, len, 4).unwrap_or(0);
+    if !(h0 == b'H' && h1 == b'T' && h2 == b'T' && h3 == b'P' && h4 == b'/') {
+        return 0;
+    }
+
+    let mut status_start = 0usize;
+    for si in 5..TLS_SCRATCH_LEN {
+        if si >= len {
+            break;
+        }
+        let c = read_u8(ptr, len, si).unwrap_or(0);
+        if c == b' ' {
+            status_start = si + 1;
+            break;
+        }
+    }
+    if status_start == 0 || status_start + 3 > len {
+        return 0;
+    }
+
+    let a = read_u8(ptr, len, status_start).unwrap_or(0);
+    let b = read_u8(ptr, len, status_start + 1).unwrap_or(0);
+    let c = read_u8(ptr, len, status_start + 2).unwrap_or(0);
+
+    if a < b'0' || a > b'9' || b < b'0' || b > b'9' || c < b'0' || c > b'9' {
+        return 0;
+    }
+
+    ((a - b'0') as u16) * 100 + ((b - b'0') as u16) * 10 + ((c - b'0') as u16)
+}
+
 /// SSL_write(SSL *ssl, const void *buf, int num)
 #[uprobe]
 pub fn ssl_write_entry(ctx: ProbeContext) -> u32 {
@@ -359,20 +390,13 @@ unsafe fn handle_ssl_write_entry(ctx: &ProbeContext) -> Result<u32, i64> {
     Ok(0)
 }
 
-/// `SSL_write` return — keep **all** logic in this symbol. Splitting into a `handle_*` callee can
-/// produce a tiny BPF stub (~2 insns) that bpf-linker never merges with the body (aya-rs/aya#1056).
-///
-/// **Section name:** use a unique `uretprobe/...` per program. Plain `uretprobe` merges every
-/// return probe into one ELF section; on older kernels (e.g. 5.15) that can trip `check_subprogs`
-/// (`last insn is not an exit or jmp`) even when aya loads by symbol.
-/// `extern "C"` so LLVM emits a single `exit` tail for this program. The Rust ABI can leave dead
-/// insns after `exit` (e.g. `call 0`), which breaks Linux 5.15 `check_subprogs` (`last insn is not
-/// an exit or jmp`).
+/// SSL_write return (TLS + HTTP parsing).
 #[no_mangle]
 #[link_section = "uretprobe/ssl_write_return"]
 pub unsafe extern "C" fn ssl_write_return(ctx: *mut c_void) -> u32 {
     let ctx = RetProbeContext::new(ctx);
     let pid_tgid = bpf_get_current_pid_tgid();
+
     let ret = match ctx.ret::<i32>() {
         Some(r) => r,
         None => return 0,
@@ -397,28 +421,41 @@ pub unsafe extern "C" fn ssl_write_return(ctx: *mut c_void) -> u32 {
         return 0;
     };
 
-    let read_len = (args.len as usize).min(TLS_SCRATCH_LEN);
+    let read_len = core::cmp::min(args.len as usize, TLS_SCRATCH_LEN);
     let mut buf = [0u8; TLS_SCRATCH_LEN];
-    if bpf_probe_read_user_buf(args.buf_ptr as *const u8, &mut buf[..read_len]).is_err() {
+
+    // Avoid dynamic slicing syntax: create slice via raw parts (no bounds-check panic paths).
+    let slice = core::slice::from_raw_parts_mut(buf.as_mut_ptr(), read_len);
+    if bpf_probe_read_user_buf(args.buf_ptr as *const u8, slice).is_err() {
         return 0;
     }
 
-    let has_sni = parse_tls_clienthello_sni!(&buf[..read_len], &mut (*st).tls_sni);
+    let ptr = buf.as_ptr();
 
-    let mut has_http = 0u8;
-    parse_http_request!(
-        &buf[..read_len],
-        &mut (*st).http_host,
-        &mut (*st).http_method,
-        &mut (*st).http_path,
-        &mut has_http
+    // TLS SNI
+    let has_sni = parse_tls_clienthello_sni(ptr, read_len, (*st).tls_sni.as_mut_ptr());
+
+    // HTTP request
+    let mut has_http: u8 = 0;
+    parse_http_request(
+        ptr,
+        read_len,
+        (*st).http_host.as_mut_ptr(),
+        (*st).http_method.as_mut_ptr(),
+        (*st).http_path.as_mut_ptr(),
+        &mut has_http as *mut u8,
     );
 
-    let mut has_tls = 0u8;
+    // TLS detection
+    let mut has_tls: u8 = 0;
     if has_sni != 0 {
         has_tls = 1;
-    } else if read_len >= 6 && buf[0] == 0x16 && buf[5] == 0x01 {
-        has_tls = 1;
+    } else if read_len >= 6 {
+        let b0 = read_u8(ptr, read_len, 0).unwrap_or(0);
+        let b5 = read_u8(ptr, read_len, 5).unwrap_or(0);
+        if b0 == 0x16 && b5 == 0x01 {
+            has_tls = 1;
+        }
     }
 
     if has_tls != 0 {
@@ -462,12 +499,12 @@ unsafe fn handle_ssl_read_entry(ctx: &ProbeContext) -> Result<u32, i64> {
     Ok(0)
 }
 
-/// See `ssl_write_return`: `extern "C"` for a clean BPF `exit` epilogue on older kernels.
 #[no_mangle]
 #[link_section = "uretprobe/ssl_read_return"]
 pub unsafe extern "C" fn ssl_read_return(ctx: *mut c_void) -> u32 {
     let ctx = RetProbeContext::new(ctx);
     let pid_tgid = bpf_get_current_pid_tgid();
+
     let ret = match ctx.ret::<i32>() {
         Some(r) => r,
         None => return 0,
@@ -483,9 +520,12 @@ pub unsafe extern "C" fn ssl_read_return(ctx: *mut c_void) -> u32 {
     };
     let _ = SSL_READ_ARGS.remove(&pid_tgid);
 
-    let read_len = (ret as usize).min(TLS_SCRATCH_LEN);
+    let read_len = core::cmp::min(ret as usize, TLS_SCRATCH_LEN);
     let mut buf = [0u8; TLS_SCRATCH_LEN];
-    if bpf_probe_read_user_buf(args.buf_ptr as *const u8, &mut buf[..read_len]).is_err() {
+
+    // No dynamic slice syntax
+    let slice = core::slice::from_raw_parts_mut(buf.as_mut_ptr(), read_len);
+    if bpf_probe_read_user_buf(args.buf_ptr as *const u8, slice).is_err() {
         return 0;
     }
 
@@ -494,7 +534,7 @@ pub unsafe extern "C" fn ssl_read_return(ctx: *mut c_void) -> u32 {
         None => return 0,
     };
 
-    let status = parse_http_status!(&buf[..read_len]);
+    let status = parse_http_status(buf.as_ptr(), read_len);
     if status == 0 {
         return 0;
     }
@@ -502,7 +542,11 @@ pub unsafe extern "C" fn ssl_read_return(ctx: *mut c_void) -> u32 {
     let Some(st) = FLOW_TABLE.get_ptr_mut(&flow_key) else {
         return 0;
     };
+
     (*st).http_status = status;
+
+    // NOTE: FlowState has no ssl_read_ts_ns — don’t write it.
+    // If you want a timestamp, use an existing field or add one to FlowState.
+
     0
 }
-
