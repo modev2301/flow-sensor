@@ -26,7 +26,7 @@ unsafe fn copy_bytes_bounded(
 use core::ffi::c_void;
 
 use aya_ebpf::{
-    helpers::{bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_user_buf},
+    helpers::{bpf_get_current_pid_tgid, bpf_ktime_get_ns, gen},
     macros::{map, uprobe},
     maps::HashMap,
     programs::{ProbeContext, RetProbeContext},
@@ -416,10 +416,15 @@ pub unsafe extern "C" fn ssl_write_return(ctx: *mut c_void) -> u32 {
 
     let read_len = core::cmp::min(args.len as usize, TLS_SCRATCH_LEN);
     let mut buf = [0u8; TLS_SCRATCH_LEN];
-
-    // Avoid dynamic slicing syntax: create slice via raw parts (no bounds-check panic paths).
-    let slice = core::slice::from_raw_parts_mut(buf.as_mut_ptr(), read_len);
-    if bpf_probe_read_user_buf(args.buf_ptr as *const u8, slice).is_err() {
+    // Call the raw helper instead of `bpf_probe_read_user_buf` + `from_raw_parts_mut`: LLVM can
+    // leave `r0` as the memset destination across the epilogue, and the verifier rejects
+    // `BPF_EXIT` with `r0` pointing at the stack ("cannot return stack pointer to the caller").
+    let pr = gen::bpf_probe_read_user(
+        buf.as_mut_ptr().cast::<c_void>(),
+        read_len as u32,
+        (args.buf_ptr as *const u8).cast::<c_void>(),
+    );
+    if pr != 0 {
         return 0;
     }
 
@@ -515,10 +520,12 @@ pub unsafe extern "C" fn ssl_read_return(ctx: *mut c_void) -> u32 {
 
     let read_len = core::cmp::min(ret as usize, TLS_SCRATCH_LEN);
     let mut buf = [0u8; TLS_SCRATCH_LEN];
-
-    // No dynamic slice syntax
-    let slice = core::slice::from_raw_parts_mut(buf.as_mut_ptr(), read_len);
-    if bpf_probe_read_user_buf(args.buf_ptr as *const u8, slice).is_err() {
+    let pr = gen::bpf_probe_read_user(
+        buf.as_mut_ptr().cast::<c_void>(),
+        read_len as u32,
+        (args.buf_ptr as *const u8).cast::<c_void>(),
+    );
+    if pr != 0 {
         return 0;
     }
 
