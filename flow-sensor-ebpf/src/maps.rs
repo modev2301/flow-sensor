@@ -3,7 +3,7 @@
 
 use aya_ebpf::{
     macros::map,
-    maps::{HashMap, LruHashMap, PerfEventArray, PerCpuArray, RingBuf},
+    maps::{HashMap, LruHashMap, PerfEventArray, RingBuf},
 };
 use flow_sensor_common::*;
 
@@ -156,23 +156,10 @@ pub static RECVMSG_SOCK: HashMap<u64, u64> = HashMap::with_max_entries(4096, 0);
 #[map]
 pub static TLS_THREAD_FLOW: HashMap<u64, FlowKey> = HashMap::with_max_entries(8192, 0);
 
-/// Plaintext scratch for `SSL_write` / `SSL_read` uprobes (`bpf_probe_read_user` target).
-/// Must live in a map: on Linux ≤5.15 the verifier rejects **variable-offset reads from the stack**
-/// (`read_u8` → `ptr.add(idx)`), which TLS parsing needs.
-///
-/// Keep this modest: `parse_tls_clienthello_sni` applies **RFC length caps** (e.g. session id ≤32)
-/// so the 5.15 verifier does not assume `u8::MAX` hops through the buffer — inflating only the map
-/// does not fix `off=value_size+1` failures from `*(ptr + end + 1)`-style lowered loads.
+/// Max bytes read from the SSL userspace buffer per uretprobe (each byte via `bpf_probe_read_user`).
+/// TLS/HTTP parsers walk plaintext with **variable indices**; copying into a map then using
+/// `ptr.add(idx)` still produces `invalid access to map value` on Linux 5.15 — so we do not bulk-copy.
 pub const TLS_SCRATCH_LEN: usize = 256;
-
-#[repr(C)]
-pub struct TlsUprobeScratch {
-    pub data: [u8; TLS_SCRATCH_LEN],
-}
-
-#[map]
-pub static TLS_UPROBE_SCRATCH: PerCpuArray<TlsUprobeScratch> =
-    PerCpuArray::with_max_entries(1, 0);
 
 /// LRU hash — kernel evicts oldest entries automatically under memory pressure
 /// Key: FlowKey (5-tuple), Value: FlowState
